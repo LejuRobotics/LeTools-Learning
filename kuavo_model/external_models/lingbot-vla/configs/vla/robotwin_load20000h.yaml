@@ -1,0 +1,43 @@
+model:
+  model_path: robbyant/lingbot-vla-4b
+  tokenizer_path: Qwen/Qwen2.5-VL-3B-Instruct
+
+data:
+  datasets_type: vla
+  data_name: robotwin
+  train_path: robotwin/
+  joints:
+    - arm.position: 14
+    - effector.position: 2
+  cameras:
+    - camera_top
+    - camera_wrist_left
+    - camera_wrist_right
+  num_workers: 8
+  norm_type: bounds_99
+  norm_stats_file: assets/norm_stats/robotwin_50.json
+
+train:
+  output_dir: output/
+  loss_type: L1_fm
+  data_parallel_mode: fsdp2
+  enable_full_shard: false
+  module_fsdp_enable: true
+  use_compile: true
+  rmpad: false
+  rmpad_with_pos_ids: false
+  ulysses_parallel_size: 1
+  freeze_vision_encoder: false
+  tokenizer_max_length: 72
+  max_action_dim: 75
+  max_state_dim: 75
+  lr: 1.0e-4
+  lr_decay_style: constant
+  micro_batch_size: 32
+  gradient_accumulation_steps: 1 # global_batch_size = micro_batch_size * gradient_accumulation_steps * 8 = 256 when we train with 8 GPUs
+  max_steps: 20000
+  ckpt_manager: dcp
+  save_steps: 20000
+  save_epochs: 0
+  enable_fp32: true   # Control the precision of the action expert
+  enable_resume: true

@@ -1,0 +1,118 @@
+dataset:  # 数据集相关设置。
+  repo_id: "lerobot/your_dataset"  # 数据集名字，用来做标识。
+  root: null  # 本地数据路径。
+  episodes: null  # 只训练指定的 episode；不填就是全量。
+  image_transforms: {}  # 额外的图像预处理设置。
+  revision: null  # 远程数据集版本；本地训练一般不用改。
+  use_imagenet_stats: true  # 图像是否用 ImageNet 的均值方差做归一化。
+  video_backend: pyav  # 读视频帧用的后端。一般用 pyav。
+  return_uint8: false  # 是否保留图像为 uint8，而不是转换成 float tensor。
+  streaming: false  # 是否流式读数据。一般保持 false。
+
+training:  # 训练流程设置。
+  output_dir: "outputs/train/multi_task_dit"  # 训练输出目录。
+  job_name: "multi_task_dit"  # 实验名。
+  resume: false  # 是否从 output_dir 最新 checkpoint 继续训；续训改为 true，并修改 output_dir 为上阶段 run 的产物路径，如 outputs/train/multi_task_dit_YYYYMMDD_HHMMSS。
+  seed: 1000  # 随机种子。
+  cudnn_deterministic: false  # 更稳定可复现，但会慢一点。
+  num_workers: 4  # 读数据用的进程数。
+  batch_size: 8  # 每张卡上的 batch size。
+  prefetch_factor: 4  # 每个读数据进程提前准备多少个 batch。
+  persistent_workers: true  # 是否让读数据进程常驻。
+  steps: 100000  # 总训练步数。
+  eval_freq: 10000  # 每隔多少步做一次评测。
+  log_freq: 100  # 每隔多少步打一次日志。
+  tolerance_s: 1.0e-4  # 视频帧和标注对齐时允许的时间误差。
+  save_checkpoint: true  # 是否保存 checkpoint。
+  save_freq: 10000  # 每隔多少步存一次权重。
+  use_policy_training_preset: true  # 是否用模型自带的优化器和调度器默认值。
+  optimizer: null  # 手动指定优化器；一般留空。
+  scheduler: null  # 手动指定学习率策略；一般留空。
+  use_rabc: false  # 是否启用 RABC。一般不用。
+  rabc_progress_path: null  # RABC 用的额外文件路径。一般不用。
+  rabc_kappa: 0.01  # RABC 参数。一般不用改。
+  rabc_epsilon: 1.0e-6  # RABC 的稳定性参数。一般不用改。
+  rabc_head_mode: "sparse"  # RABC 模式。一般不用改。
+  rename_map: {}  # 特征重命名表。一般不用。
+
+eval:  # 训练中评测设置。
+  n_episodes: 50  # 每次评测跑多少条。
+  batch_size: 0  # 评测 batch size。0 表示自动。
+  use_async_envs: true  # 评测环境是否并行异步跑。
+
+wandb:  # wandb 设置。
+  enable: false  # 是否启用 wandb。
+  disable_artifact: false  # 是否禁用向 wandb 上传文件。
+  project: "lerobot"  # wandb 项目名。
+  entity: null  # wandb 账号或团队名。
+  notes: null  # wandb 备注。
+  run_id: null  # wandb run id。
+  mode: null  # wandb 模式。
+  add_tags: true  # 是否自动加 wandb 标签。
+
+peft: null  # PEFT 设置。一般留空。
+
+policy:  # 模型相关设置。
+  type: "multi_task_dit"  # 模型类型。
+  n_obs_steps: 2  # 一次预测会看几帧观测。
+  input_features: {}  # 手动指定输入特征。一般不用。
+  output_features: {}  # 手动指定输出特征。一般不用。
+  device: "cuda"  # 运行设备。
+  use_amp: false  # 是否启用混合精度。
+  use_peft: false  # 是否启用 PEFT。
+  push_to_hub: false  # 是否上传到 Hugging Face。
+  repo_id: null  # 上传时用的仓库名。
+  private: null  # 上传仓库是否私有。
+  tags: null  # 上传时的标签。
+  license: null  # 上传时的 license。
+  pretrained_path: null  # 通常从头训（填 null）或填本地/LeRobot checkpoint。二阶段微调请改为上一 run 的 <policy_name>_YYYYMMDD_HHMMSS/checkpoints/<step>/pretrained_model 路径。
+  horizon: 32  # 模型内部预测的总长度。
+  n_action_steps: 24  # 每次真正执行多少步动作。
+  objective: "diffusion"  # 训练目标类型。
+  noise_scheduler_type: "DDPM"  # 噪声调度器类型。
+  num_train_timesteps: 100  # 训练时的扩散步数。
+  beta_schedule: "squaredcos_cap_v2"  # beta 调度方式。
+  beta_start: 1.0e-4  # beta 起始值。
+  beta_end: 0.02  # beta 结束值。
+  prediction_type: "epsilon"  # 模型预测什么目标。
+  clip_sample: true  # 是否裁剪去噪结果。
+  clip_sample_range: 1.0  # 裁剪范围。
+  num_inference_steps: null  # 推理时去噪多少步；不填就用默认。
+  sigma_min: 0.0  # 最小 sigma。
+  num_integration_steps: 100  # 积分步数。
+  integration_method: "euler"  # 积分方法。
+  timestep_sampling_strategy: "beta"  # 时间步采样策略。
+  timestep_sampling_s: 0.999  # 时间步采样参数 s。
+  timestep_sampling_alpha: 1.5  # 时间步采样 alpha。
+  timestep_sampling_beta: 1.0  # 时间步采样 beta。
+  hidden_dim: 512  # 主隐藏维度。
+  num_layers: 6  # 层数。
+  num_heads: 8  # 注意力头数。
+  dropout: 0.1  # dropout 比例。
+  use_positional_encoding: false  # 是否启用位置编码。
+  timestep_embed_dim: 256  # 时间嵌入维度。
+  use_rope: true  # 是否启用 RoPE。
+  rope_base: 10000.0  # RoPE base。
+  vision_encoder_name: "openai/clip-vit-base-patch16"  # 视觉编码器模型名。
+  use_separate_rgb_encoder_per_camera: false  # 每个相机是否单独编码。
+  vision_encoder_lr_multiplier: 0.1  # 视觉编码器学习率倍率。
+  image_resize_shape: null  # 图像先 resize 到多大。
+  image_crop_shape: [224, 224]  # 图像 crop 尺寸。
+  image_crop_is_random: true  # 是否随机 crop。
+  text_encoder_name: "openai/clip-vit-base-patch16"  # 文本编码器模型名。
+  tokenizer_max_length: 77  # 文本最大长度。
+  tokenizer_padding: "max_length"  # padding 模式。
+  tokenizer_padding_side: "right"  # padding 方向。
+  tokenizer_truncation: true  # 是否截断过长文本。
+  normalization_mapping:  # 不同输入的归一化方式。
+    VISUAL: "MEAN_STD"  # 图像怎么归一化。
+    STATE: "MIN_MAX"  # 状态怎么归一化。
+    ACTION: "MIN_MAX"  # 动作怎么归一化。
+  optimizer_lr: 2.0e-5  # 主学习率。
+  optimizer_betas: [0.95, 0.999]  # 优化器 beta 参数。
+  optimizer_eps: 1.0e-8  # 优化器 epsilon。
+  optimizer_weight_decay: 0.0  # weight decay。
+  scheduler_name: "cosine"  # 学习率策略。
+  scheduler_warmup_steps: 0  # warmup 步数。
+  do_mask_loss_for_padding: false  # 算 loss 时是否忽略 padding。
+  drop_n_last_frames: null  # 训练时丢掉最后几帧，减少 padding 影响。

@@ -1,0 +1,183 @@
+dataset:  # 数据集相关设置。
+  repo_id: "lerobot/your_dataset"  # 数据集名字，用来做标识。
+  root: null  # 本地数据路径。
+  episodes: null  # 只训练指定的 episode；不填就是全量。
+  image_transforms: {}  # 额外的图像预处理设置。
+  revision: null  # 远程数据集版本；本地训练一般不用改。
+  use_imagenet_stats: true  # 图像是否用 ImageNet 的均值方差做归一化。
+  video_backend: pyav  # 读视频帧用的后端。一般用 pyav。
+  return_uint8: false  # 是否保留图像为 uint8，而不是转换成 float tensor。
+  streaming: false  # 是否流式读数据。一般保持 false。
+
+training:  # 训练流程设置。
+  output_dir: "outputs/train/xvla"  # 训练输出目录。
+  job_name: "xvla"  # 实验名。
+  resume: false  # 是否从 output_dir 最新 checkpoint 继续训；续训改为 true，并修改 output_dir 为上阶段 run 的产物路径，如 outputs/train/xvla_YYYYMMDD_HHMMSS。
+  seed: 1000  # 随机种子。
+  cudnn_deterministic: false  # 更稳定可复现，但会慢一点。
+  num_workers: 4  # 读数据用的进程数。
+  batch_size: 8  # 每张卡上的 batch size。
+  prefetch_factor: 4  # 每个读数据进程提前准备多少个 batch。
+  persistent_workers: true  # 是否让读数据进程常驻。
+  steps: 30000  # 总训练步数。
+  eval_freq: 5000  # 每隔多少步做一次评测。
+  log_freq: 100  # 每隔多少步打一次日志。
+  tolerance_s: 1.0e-4  # 视频帧和标注对齐时允许的时间误差。
+  save_checkpoint: true  # 是否保存 checkpoint。
+  save_freq: 5000  # 每隔多少步存一次权重。
+  use_policy_training_preset: true  # 是否用模型自带的优化器和调度器默认值。
+  optimizer: null  # 手动指定优化器；一般留空。
+  scheduler: null  # 手动指定学习率策略；一般留空。
+  use_rabc: false  # 是否启用 RABC。一般不用。
+  rabc_progress_path: null  # RABC 用的额外文件路径。一般不用。
+  rabc_kappa: 0.01  # RABC 参数。一般不用改。
+  rabc_epsilon: 1.0e-6  # RABC 的稳定性参数。一般不用改。
+  rabc_head_mode: "sparse"  # RABC 模式。一般不用改。
+  rename_map: {}  # 特征重命名表。一般不用。
+
+eval:  # 训练中评测设置。
+  n_episodes: 50  # 每次评测跑多少条。
+  batch_size: 0  # 评测 batch size。0 表示自动。
+  use_async_envs: true  # 评测环境是否并行异步跑。
+
+wandb:  # wandb 设置。
+  enable: false  # 是否启用 wandb。
+  disable_artifact: false  # 是否禁用向 wandb 上传文件。
+  project: "lerobot"  # wandb 项目名。
+  entity: null  # wandb 账号或团队名。
+  notes: null  # wandb 备注。
+  run_id: null  # wandb run id。
+  mode: null  # wandb 模式。
+  add_tags: true  # 是否自动加 wandb 标签。
+
+peft: null  # PEFT 设置。一般留空。
+
+policy:  # 模型相关设置。
+  type: "xvla"  # 模型类型。
+  n_obs_steps: 1  # 一次预测会看几帧观测。
+  input_features: {}  # 手动指定输入特征。一般不用。
+  output_features: {}  # 手动指定输出特征。一般不用。
+  device: "cuda"  # 运行设备。
+  use_amp: false  # 是否启用混合精度。
+  use_peft: false  # 是否启用 PEFT。
+  push_to_hub: false  # 是否上传到 Hugging Face。
+  repo_id: null  # 上传时用的仓库名。
+  private: null  # 上传仓库是否私有。
+  tags: null  # 上传时的标签。
+  license: null  # 上传时的 license。
+  pretrained_path: "lerobot/xvla-base"  # 官方 XVLA 基座；action_dim/domain 不匹配时请按文档调整或换 xvla 变体；从头训练请改为 null。二阶段微调请改为上一 run 的 <policy_name>_YYYYMMDD_HHMMSS/checkpoints/<step>/pretrained_model 路径。
+  chunk_size: 30  # 每次预测多长的动作序列（须与所用 checkpoint 一致）。
+  n_action_steps: 30  # 每次真正执行多少步动作；须不大于 chunk_size。
+  dtype: "float32"  # 计算精度。
+  normalization_mapping:  # 不同输入的归一化方式。
+    VISUAL: "IDENTITY"  # 图像怎么归一化。
+    STATE: "IDENTITY"  # 状态怎么归一化。
+    ACTION: "MEAN_STD"  # 动作怎么归一化（与 xvla-base 一致）。
+  florence_config:  # Florence2 多模态 VLM 配置；须与预训练权重严格一致。
+    model_type: "florence2"  # HF 配置里的模型类型标识。
+    bos_token_id: 0  # 序列开始 token id。
+    eos_token_id: 2  # 序列结束 token id。
+    ignore_index: -100  # 计算 loss 时忽略的标号。
+    pad_token_id: 1  # padding token id。
+    projection_dim: 1024  # 视觉特征投影到与语言同维后的维度。
+    text_config:  # 文本侧 BART 风格编码器（encoder 用于 XVLA）。
+      vocab_size: 51289  # 词表大小。
+      activation_dropout: 0.1  # 激活层 dropout。
+      activation_function: "gelu"  # 激活函数。
+      add_bias_logits: false  # 是否在 logits 加偏置。
+      add_final_layer_norm: false  # 是否在末尾加 LayerNorm。
+      attention_dropout: 0.1  # 注意力 dropout。
+      bos_token_id: 0  # 文本 BOS（与顶层一致）。
+      classif_dropout: 0.1  # 分类头 dropout。
+      classifier_dropout: 0.0  # 分类器 dropout。
+      d_model: 1024  # 隐藏维度。
+      decoder_attention_heads: 16  # 解码器头数（结构保留；XVLA 侧主要用 encoder）。
+      decoder_ffn_dim: 4096  # 解码器 FFN 中间维。
+      decoder_layerdrop: 0.0  # 解码器 LayerDrop 概率。
+      decoder_layers: 12  # 解码器层数。
+      decoder_start_token_id: 2  # 解码起始 token。
+      dropout: 0.1  # 通用 dropout。
+      early_stopping: true  # 生成时早停策略开关（配置项保留）。
+      encoder_attention_heads: 16  # 编码器注意力头数。
+      encoder_ffn_dim: 4096  # 编码器 FFN 中间维。
+      encoder_layerdrop: 0.0  # 编码器 LayerDrop。
+      encoder_layers: 12  # 编码器层数。
+      eos_token_id: 2  # 文本 EOS。
+      forced_eos_token_id: 2  # 强制结束 token。
+      forced_bos_token_id: 0  # 强制起始 token。
+      gradient_checkpointing: false  # 是否对语言模型做梯度检查点。
+      init_std: 0.02  # 权重初始化标准差。
+      is_encoder_decoder: true  # 是否为 encoder-decoder 架构。
+      label2id:  # 分类标签映射（配置兼容字段）。
+        LABEL_0: 0  # 标签 0。
+        LABEL_1: 1  # 标签 1。
+        LABEL_2: 2  # 标签 2。
+      max_position_embeddings: 4096  # 语言位置编码最大长度（决定 embed_positions 形状）。
+      no_repeat_ngram_size: 3  # 生成时禁止重复的 n-gram 大小。
+      normalize_before: false  # 是否在子层前做 LayerNorm（Pre-LN）。
+      num_hidden_layers: 12  # 与 encoder 层数一致的兼容字段。
+      pad_token_id: 1  # 文本 PAD。
+      scale_embedding: false  # 是否对嵌入按 sqrt(d_model) 缩放。
+      num_beams: 3  # beam search 宽度（配置保留）。
+    vision_config:  # DaViT 视觉骨干（SigLIP/Florence2 视觉塔）。
+      model_type: "davit"  # 视觉塔类型标识。
+      drop_path_rate: 0.1  # DropPath 随机深度率。
+      patch_size: [7, 3, 3, 3]  # 各 stage 的 patch 大小。
+      patch_stride: [4, 2, 2, 2]  # 各 stage 的步幅。
+      patch_padding: [3, 1, 1, 1]  # 各 stage 的 padding。
+      patch_prenorm: [false, true, true, true]  # 各 stage patch 嵌入前是否先 Norm。
+      enable_checkpoint: false  # 视觉塔内梯度检查点（与 PyTorch checkpoint 不同名）。
+      dim_embed: [256, 512, 1024, 2048]  # 各 stage 通道维度。
+      num_heads: [8, 16, 32, 64]  # 各 stage 注意力头数。
+      num_groups: [8, 16, 32, 64]  # 各 stage 分组卷积/注意力分组。
+      depths: [1, 1, 9, 1]  # 各 stage block 重复深度。
+      window_size: 12  # 局部窗口注意力边长。
+      projection_dim: 1024  # 视觉输出投影维度（与多模态 fusion 一致）。
+      visual_temporal_embedding:  # 多帧时的时序位置编码。
+        type: "COSINE"  # 时序编码类型。
+        max_temporal_embeddings: 100  # 最大可建模帧数/时序长度。
+      image_pos_embed:  # 2D 图像可学习位置编码。
+        type: "learned_abs_2d"  # 绝对 2D 可学习编码。
+        max_pos_embeddings: 50  # 网格边长上限（与输入分辨率、patch 匹配；改分辨率须改此项与权重）。
+      image_feature_source:  # 从视觉塔取哪些池化特征。
+        - "spatial_avg_pool"  # 空间平均池化分支。
+        - "temporal_avg_pool"  # 时序平均池化分支。
+    vocab_size: 51289  # Florence2 顶层词表大小（与 text_config 一致）。
+    torch_dtype: "float32"  # 配置记录的权重 dtype。
+    is_encoder_decoder: true  # Florence2 是否为 encoder-decoder。
+  tokenizer_name: "facebook/bart-large"  # 分词器与文本侧对应的预训练名。
+  tokenizer_max_length: 1024  # 分词后最大 token 长度（与长指令兼容）。
+  tokenizer_padding_side: "right"  # padding 在序列右侧。
+  pad_language_to: "max_length"  # 语言张量 padding 策略。
+  hidden_size: 1024  # 策略 Transformer 隐藏维度。
+  depth: 24  # 策略 Transformer 层数。
+  num_heads: 16  # 策略 Transformer 注意力头数。
+  mlp_ratio: 4.0  # FFN 相对隐藏维的扩张比例。
+  num_domains: 30  # domain / 任务槽位数（与 soft prompt、checkpoint 一致）。
+  len_soft_prompts: 32  # 可学习 soft prompt 长度。
+  dim_time: 32  # 扩散/流匹配时间步嵌入维度。
+  max_len_seq: 512  # 策略 Transformer 可接受的最大序列长度（决定 pos_emb 形状）。
+  use_hetero_proj: false  # 是否使用异构模态投影层。
+  action_mode: "auto"  # 动作参数化：末端 6D 位姿等；与 build_action_space 一致。
+  num_denoising_steps: 10  # 推理时去噪/采样步数。
+  use_proprio: true  # 是否把机器人本体状态输入策略。
+  max_state_dim: 20  # 状态向量 padding 上限（须与 checkpoint 一致）。
+  max_action_dim: 20  # 动作维度 padding 上限（须与 checkpoint 一致）。
+  domain_feature_key: null  # 数据集中表示 domain id 的特征键；无则 null。
+  resize_imgs_with_padding: [224, 224]  # 保比缩放后 pad 到的 H,W（改尺寸会改变视觉塔特征格点数）。
+  num_image_views: 3  # 期望的多相机视角数（与数据集相机数、empty_cameras 配合）。
+  empty_cameras: 0  # 用空白占位补满的相机路数。
+  freeze_vision_encoder: false  # 是否冻结 Florence2 视觉编码器。
+  freeze_language_encoder: false  # 是否冻结语言编码器。
+  train_policy_transformer: true  # 是否训练策略 Transformer 主体。
+  train_soft_prompts: true  # 是否训练 soft prompts。
+  optimizer_lr: 0.0001  # 主学习率。
+  optimizer_betas: [0.9, 0.95]  # 优化器 beta 参数。
+  optimizer_eps: 1.0e-8  # 优化器 epsilon。
+  optimizer_weight_decay: 0.0001  # weight decay。
+  optimizer_grad_clip_norm: 10.0  # 梯度裁剪阈值。
+  optimizer_soft_prompt_lr_scale: 1.0  # soft prompt 相对主 LR 的倍率。
+  optimizer_soft_prompt_warmup_lr_scale: null  # soft prompt 热身上限倍率；null 表示不用。
+  scheduler_warmup_steps: 1000  # 学习率 warmup 步数。
+  scheduler_decay_steps: 30000  # 余弦衰减长度（步数）。
+  scheduler_decay_lr: 2.5e-6  # 衰减末端学习率。

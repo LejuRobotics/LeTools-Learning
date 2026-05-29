@@ -1,0 +1,38 @@
+hydra:  # Hydra 配置文件保存目录，仅供参数检查使用
+  run:
+    dir: ./outputs/data_cvt_hydra_save/singlerun/${now:%Y%m%d_%H%M%S}  # 单次运行目录
+  sweep:
+    dir: ./outputs/data_cvt_hydra_save/multirun/${now:%Y%m%d_%H%M%S}  # sweep 时的根目录
+    subdir: ${hydra:job.override_dirname}
+
+
+# kuavo rosbag数据转换成lerobot-parquet格式的配置文件
+# 请注意！！！
+# 本分支的数转代码与 lerobot 0.5.2 同步
+# 数据集格式使用的是 lerobot dataset v3.0
+# lerobot地址：https://github.com/huggingface/lerobot
+
+rosbag:
+  mode: normal  # 可选: normal, resume, merge
+  rosbag_dir: /path/to/rosbags # rosbag文件存放的目录。normal / resume 模式需要
+  target_dir: /path/to/target_dir  # 输出父目录；最终数据集会生成在 target_dir/lerobot
+  lerobot_dir_resume: /path/to/lerobot_resume  # resume 模式下，已有 lerobot 数据集的目录
+  lerobot_dir_merge: 
+    ["/path/to/lerobot1",
+    "/path/to/lerobot2"]  # merge 模式下，要合并的多个 lerobot 数据集目录列表
+
+dataset:
+  platform_type: "4pro"  # 硬件平台类型，可选: "4pro", "5w" 或 "5"，默认使用 configs/platform/platform_config.yaml 中的 default 值，比赛默认4pro
+  eef_type: leju_claw # 末端执行器类型，仿真选择：rq2f85, 真机可选：leju_claw,（夹爪） qiangnao，（灵巧手）
+  which_arm: both  # 需要哪一只手臂的关节 + 图像数据，可选: left, right, both，注意图像数据会同时包含头部相机图像
+ 
+  task_description: "Pick and Place" # 任务描述，自定义
+
+  train_hz: 10  # 训练数据的采样频率
+  main_timeline: head_cam_h # 将哪个相机设为主相机，默认主相机来自：head_cam_h, 可选：wrist_cam_l, wrist_cam_r
+  main_timeline_fps: 30 # 主相机的帧率，必须稳定，默认30帧
+  sample_drop: 10 # 丢弃episode前后的10帧
+
+  resize:
+    width: 848  # 图像缩放宽度，注意请先查看（推荐浏览器foxglove工具）rosbag中图像的原始尺寸，避免放大或缩小带来模糊或拉伸形变等问题
+    height: 480  # 图像缩放高度，注意请先查看（推荐浏览器foxglove工具）rosbag中图像的原始尺寸，避免放大或缩小带来模糊或拉伸形变等问题

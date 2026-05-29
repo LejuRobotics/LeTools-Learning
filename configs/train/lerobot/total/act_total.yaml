@@ -1,0 +1,98 @@
+dataset:  
+  repo_id: "lerobot/your_dataset"  # 数据集名字，用来做标识。
+  root: null  # 本地数据路径。
+  episodes: null  # 可选的episode索引子集，用于训练
+  image_transforms: {}  # 数据加载时额外的图像变换覆盖
+  revision: null  # 可选的Hugging Face dataset修订版本或git ref
+  use_imagenet_stats: true  # RGB归一化是否使用ImageNet的均值和标准差
+  video_backend: pyav  # 用于从dataset视频中读取帧的视频解码后端
+  return_uint8: false  # 图像是否保持uint8格式，而不是转换为float张量
+  streaming: false  # 是否流式加载dataset样本，而不是正常读取整个dataset
+
+training: 
+  output_dir: "outputs/train/act"  # 检查点、日志和解析后的配置写入的目录
+  job_name: "act"  # 实验名。
+  resume: false  # 是否从 output_dir 最新 checkpoint 继续训；续训改为 true，并修改 output_dir 为上阶段 run 的产物路径，如 outputs/train/act_YYYYMMDD_HHMMSS。
+  seed: 1000  # 全局随机种子，用于重现性
+  cudnn_deterministic: false  # 强制确定性的cuDNN行为，以牺牲速度为代价
+  num_workers: 4  
+  batch_size: 8  
+  prefetch_factor: 4  # 每个DataLoader工作进程预取的批次数量
+  persistent_workers: true  # 在epoch/迭代之间保持DataLoader工作进程活跃
+  steps: 100000  # 
+  eval_freq: 20000  # 每N训练步运行一次评估
+  log_freq: 200  # 每N训练步记录一次指标
+  tolerance_s: 1.0e-4  # 对齐视频帧到样本时的时间戳容差，单位为秒
+  save_checkpoint: true  # 训练期间是否保存checkpoint
+  save_freq: 20000  # 每N训练步保存一次checkpoint
+  use_policy_training_preset: true  # 让LeRobot根据policy preset填充优化器/调度器默认值
+  optimizer: null  # 可选的显式优化器配置，null表示使用policy/default preset
+  scheduler:
+    type: cosine_decay_with_warmup
+    num_warmup_steps: 1000      # 学习率预热的步数，例如1000步
+    num_decay_steps: 100000     # 开始衰减的步数，通常与你的总 steps 参数看齐
+    peak_lr: 1.0e-5             # 预热达到的最高学习率
+    decay_lr: 1.0e-6            # 最终衰减到的最小学习率
+  use_rabc: false  # 如果支持，启用RABC/重加权逻辑
+  rabc_progress_path: null  # RABC 用的额外文件路径。一般不用。
+  rabc_kappa: 0.01  # RABC 参数。一般不用改。
+  rabc_epsilon: 1.0e-6  # RABC 的稳定性参数。一般不用改。
+  rabc_head_mode: "sparse"  # RABC 模式。一般不用改。
+  rename_map: {}  # 特征重命名表。一般不用。
+
+eval:  
+  n_episodes: 50  # 每次评测跑多少条。
+  batch_size: 0  # 评测 batch size。0 表示自动。
+  use_async_envs: true  # 评测环境是否并行异步跑。
+
+wandb:  # wandb 设置。
+  enable: false  # 是否启用 wandb。
+  disable_artifact: false  # 是否禁用向 wandb 上传文件。
+  project: "lerobot"  # wandb 项目名。
+  entity: null  # wandb 账号或团队名。
+  notes: null  # wandb 备注。
+  run_id: null  # wandb run id。
+  mode: null  # wandb 模式。
+  add_tags: true  # 是否自动加 wandb 标签。
+
+peft: null  # PEFT 设置。一般留空。
+
+policy:  # 模型相关设置。
+  type: "act"  # 模型类型。
+  n_obs_steps: 1  # 一次预测会看几帧观测。
+  input_features: {}  # 手动指定输入特征。一般不用。
+  output_features: {}  # 手动指定输出特征。一般不用。
+  device: "cuda"  # 运行设备。
+  use_amp: false  # 是否启用混合精度。
+  use_peft: false  # 是否启用 PEFT。
+  push_to_hub: false  # 是否上传到 Hugging Face。
+  repo_id: null  # 上传时用的仓库名。
+  private: null  # 上传仓库是否私有。
+  tags: null  # 上传时的标签。
+  license: null  # 上传时的 license。
+  pretrained_path: null  # 从已有 checkpoint 微调时填写。二阶段微调请改为上一 run 的 <policy_name>_YYYYMMDD_HHMMSS/checkpoints/<step>/pretrained_model 路径。
+  chunk_size: 100  # 每次预测多长的动作序列。
+  n_action_steps: 100  # 每次真正执行多少步动作。
+  normalization_mapping:  # 不同输入的归一化方式。
+    VISUAL: "MEAN_STD"  # 图像怎么归一化。
+    STATE: "MEAN_STD"  # 状态怎么归一化。
+    ACTION: "MEAN_STD"  # 动作怎么归一化。
+  vision_backbone: "resnet18"  # 图像编码主干网络。
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"  # 图像主干的预训练权重。
+  replace_final_stride_with_dilation: false  # 是否保留更高图像分辨率。
+  pre_norm: false  # 是否用 pre-norm。
+  dim_model: 512  # 模型主维度。
+  n_heads: 8  # 注意力头数。
+  dim_feedforward: 3200  # 前馈层维度。
+  feedforward_activation: "relu"  # 激活函数。
+  n_encoder_layers: 4  # encoder 层数。
+  n_decoder_layers: 1  # decoder 层数。
+  use_vae: true  # 是否启用 VAE 分支。
+  latent_dim: 32  # VAE 潜变量维度。
+  n_vae_encoder_layers: 4  # VAE encoder 层数。
+  temporal_ensemble_coeff: null  # 推理时的时间集成参数。
+  dropout: 0.1  # dropout 比例。
+  kl_weight: 10.0  # KL loss 权重。
+  optimizer_lr: 1.0e-5  # 主学习率。
+  optimizer_weight_decay: 1.0e-4  # weight decay。
+  optimizer_lr_backbone: 1.0e-5  # 图像主干单独学习率。

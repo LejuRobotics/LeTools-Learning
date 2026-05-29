@@ -1,0 +1,41 @@
+# LeRobot GR00T 简化配置。
+# 官方 policy.type 为 `groot`。
+
+dataset:  # 数据集相关设置。
+  repo_id: "lerobot/your_dataset"  # 数据集名字，用来做标识。
+  root: null  # 本地数据路径。
+
+training:  # 训练流程设置。
+  resume: false  # 是否从 output_dir 最新 checkpoint 继续训；续训改为 true，并修改 output_dir 为上阶段 run 的产物路径，如 outputs/train/gr00t_YYYYMMDD_HHMMSS。
+  output_dir: "outputs/train/gr00t"  # 训练输出目录。
+  job_name: "gr00t"  # 实验名。
+  batch_size: 8  # 每张卡上的 batch size。
+  steps: 10000  # 总训练步数。
+  save_freq: 1000  # 每隔多少步存一次权重。
+  log_freq: 100  # 每隔多少步打一次日志。
+  eval_freq: 1000  # 每隔多少步做一次评测。
+  num_workers: 4  # 读数据用的进程数。
+  seed: 1000  # 随机种子。
+
+wandb:  # wandb 设置。
+  enable: false  # 是否启用 wandb。
+  project: "lerobot_gr00t"  # wandb 项目名。
+
+policy:  # 模型相关设置。
+  type: "groot"  # 模型类型。
+  pretrained_path: null  # LeRobot 整包 checkpoint；从 NVIDIA 基座微调保持 null。二阶段微调请改为上一 run 的 <policy_name>_YYYYMMDD_HHMMSS/checkpoints/<step>/pretrained_model 路径。
+  base_model_path: "nvidia/GR00T-N1.5-3B"  # 首次微调基座；二阶段若已更改 pretrained_path 可不改此项。
+  embodiment_tag: "new_embodiment"  # Kuavo 等新机器人形态；与 processor embodiment_id 对应。
+  use_bf16: true  # 混合精度。
+  chunk_size: 50  # 动作序列长度；数据加载 action delta 上限为 min(chunk_size, 16)。
+  n_action_steps: 50  # 每次推理执行步数。
+  max_state_dim: 64  # 状态最大维度。
+  max_action_dim: 32  # 动作最大维度。
+  image_size: [224, 224]  # 输入图像尺寸。
+  tune_llm: false  # 是否训练语言部分（官方默认冻结）。
+  tune_visual: false  # 是否训练视觉部分（官方默认冻结）。
+  tune_projector: true  # 是否训练 projector。
+  tune_diffusion_model: true  # 是否训练动作头。
+  optimizer_lr: 1.0e-4  # 主学习率。
+  warmup_ratio: 0.05  # warmup 比例；调度器内部按 10000 步计算 warmup 步数。
+  dataloader_num_workers: 8  # 与 training.num_workers 对齐。

@@ -1,0 +1,31 @@
+# LeRobot Diffusion Policy 简化配置。
+dataset:
+  repo_id: "lerobot/your_dataset"  # 数据集名字，用来做标识。 
+  root: null  # 数据地址
+
+training:
+  resume: false  # 是否从 output_dir 最新 checkpoint 继续训；续训改为 true，并修改 output_dir 为上阶段 run 的产物路径，如 outputs/train/diffusion_YYYYMMDD_HHMMSS。
+  output_dir: "outputs/train/diffusion"  #  权重存储路径
+  job_name: "diffusion"  # 实验名。
+  batch_size: 16 
+  steps: 100000  # 总训练步数
+  save_freq: 20000  # 每N步保存一次权重
+  num_workers: 4  
+  seed: 1000  
+
+wandb:  # wandb的一些设置
+  enable: false  # 是否启用 wandb。
+  project: "lerobot_diffusion"  # wandb 项目名。
+
+policy:  
+  type: "diffusion"  
+  pretrained_path: null  # 从已有 checkpoint 微调时填写。二阶段微调请改为上一 run 的 <policy_name>_YYYYMMDD_HHMMSS/checkpoints/<step>/pretrained_model 路径。
+  use_amp: false  # 是否启用混合精度。
+  n_obs_steps: 2  # 观测累计的时间步数
+  horizon: 16  # 模型预测的动作序列长度
+  n_action_steps: 8  # 实际使用的动作步骤数
+  num_train_timesteps: 10  # 训练时的加噪步骤数
+  num_inference_steps: 10  # 推理时的去噪步骤数
+  drop_n_last_frames: 7  # 训练时丢掉最后几帧，减少 padding 影响。
+  optimizer_lr: 1.0e-4  # 主学习率。
+  

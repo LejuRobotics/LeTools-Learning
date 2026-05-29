@@ -1,0 +1,43 @@
+# LeRobot PI0 简化配置。
+
+dataset:  # 数据集相关设置。
+  repo_id: "lerobot/your_dataset"  # 数据集名字，用来做标识。
+  root: null  # 本地数据路径。
+
+training:  # 训练流程设置。
+  resume: false  # 是否从 output_dir 最新 checkpoint 继续训；续训改为 true，并修改 output_dir 为上阶段 run 的产物路径，如 outputs/train/pi0_YYYYMMDD_HHMMSS。
+  output_dir: "outputs/train/pi0"  # 训练输出目录。
+  job_name: "pi0"  # 实验名。
+  batch_size: 32  # 每张卡上的 batch size。
+  steps: 30000  # 总训练步数。
+  save_freq: 5000  # 每隔多少步存一次权重。
+  log_freq: 100  # 每隔多少步打一次日志。
+  num_workers: 4  # 读数据用的进程数。
+  seed: 1000  # 随机种子。
+
+wandb:  # wandb 设置。
+  enable: false  # 是否启用 wandb。
+  project: "lerobot_pi0"  # wandb 项目名。
+
+peft:  # PEFT / LoRA 微调设置（默认LoRA微调，全量微调请设置 peft: null)
+  method_type: "LORA" # LoRA 方法。
+  r: 16 # LoRA 低秩矩阵的秩
+
+policy:  # 模型相关设置。
+  type: "pi0"  # 模型类型。
+  pretrained_path: "lerobot/pi0_base"  # 官方 π₀ 基座（微调默认）；从头训练请改为 null。二阶段微调请改为上一 run 的 <policy_name>_YYYYMMDD_HHMMSS/checkpoints/<step>/pretrained_model 路径。
+  dtype: "bfloat16"  # 计算精度。
+  chunk_size: 50  # 每次预测多长的动作序列。
+  n_action_steps: 50  # 每次真正执行多少步动作。
+  max_state_dim: 32  # 状态最大维度。
+  max_action_dim: 32  # 动作最大维度。
+  num_inference_steps: 10  # 推理时去噪多少步；不填就用默认。
+  use_relative_actions: false  # 是否训练相对动作。
+  image_resolution: [224, 224]  # 输入图像分辨率。
+  gradient_checkpointing: true  # 省显存模式。
+  freeze_vision_encoder: false  # 是否冻结视觉编码器。OpenPI LoRA 不单独冻 vision。
+  train_expert_only: false  # 是否只训练动作头。
+  optimizer_lr: 2.5e-4  # LoRA 学习率（全参微调改回 2.5e-5 且 peft: null）。
+  scheduler_decay_lr: 2.5e-5  # LoRA 衰减后最小学习率（全参微调请改回 2.5e-6）。
+  scheduler_warmup_steps: 1000  # warmup 步数。
+  scheduler_decay_steps: 30000  # 学习率衰减步数。

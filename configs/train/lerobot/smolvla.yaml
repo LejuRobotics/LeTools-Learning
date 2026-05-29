@@ -1,0 +1,46 @@
+# LeRobot SmolVLA 简化配置。
+
+dataset:  # 数据集相关设置。
+  repo_id: "lerobot/your_dataset"  # 数据集名字，用来做标识。
+  root: null  # 本地数据路径。
+
+training:  # 训练流程设置。
+  resume: false  # 是否从 output_dir 最新 checkpoint 继续训；续训改为 true，并修改 output_dir 为上阶段 run 的产物路径，如 outputs/train/smolvla_YYYYMMDD_HHMMSS。
+  output_dir: "outputs/train/smolvla"  # 训练输出目录。
+  job_name: "smolvla"  # 实验名。
+  batch_size: 8  # 每张卡上的 batch size。
+  steps: 30000  # 总训练步数。
+  save_freq: 5000  # 每隔多少步存一次权重。
+  log_freq: 100  # 每隔多少步打一次日志。
+  eval_freq: 5000  # 每隔多少步做一次评测。
+  num_workers: 4  # 读数据用的进程数。
+  seed: 1000  # 随机种子。
+
+wandb:  # wandb 设置。
+  enable: false  # 是否启用 wandb。
+  project: "lerobot"  # wandb 项目名。
+  project: "lerobot_smolvla"  # wandb 项目名。
+
+peft:  # PEFT / LoRA（官方推荐；全参微调请设 peft: null 且 policy.optimizer_lr 改 1e-4）
+  method_type: "LORA"  # LoRA 方法。
+  r: 64  # 官方 libero 示例用 64；更接近全参可增大，省显存可减小。
+
+policy:  # 模型相关设置。
+  type: "smolvla"  # 模型类型。
+  pretrained_path: "lerobot/smolvla_base"  # 官方 SmolVLA 基座（微调默认）；从头训练请改为 null。二阶段微调请改为上一 run 的 <policy_name>_YYYYMMDD_HHMMSS/checkpoints/<step>/pretrained_model 路径。
+  vlm_model_name: "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # VLM 骨干。
+  chunk_size: 50  # 每次预测多长的动作序列。
+  n_action_steps: 50  # 每次真正执行多少步动作。
+  max_state_dim: 32  # 状态最大维度。
+  max_action_dim: 32  # 动作最大维度。
+  resize_imgs_with_padding: [512, 512]  # 输入图像缩放并补边。
+  tokenizer_max_length: 48  # 任务指令最大 token 数；长描述可略增。
+  num_steps: 10  # 流匹配/去噪步数（推理速度与质量权衡）。
+  freeze_vision_encoder: true  # 轻量微调默认冻结视觉。
+  train_expert_only: false  # 轻量微调默认只训动作 expert。
+  train_state_proj: true  # 是否训练状态投影层。
+  optimizer_lr: 1.0e-3  # LoRA 学习率（全参微调改 1e-4 且 peft: null）。
+  scheduler_decay_lr: 1.0e-4  # LoRA 衰减后最小学习率（全参微调请改回 2.5e-6）。
+  scheduler_warmup_steps: 1000  # warmup 步数。
+  scheduler_decay_steps: 30000  # 学习率衰减步数（宜与 training.steps 对齐）。
+

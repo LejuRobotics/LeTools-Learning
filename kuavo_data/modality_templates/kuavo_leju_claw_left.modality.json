@@ -1,0 +1,35 @@
+{
+  "state": {
+    "left_arm": {
+      "start": 0,
+      "end": 7
+    },
+    "left_gripper": {
+      "start": 7,
+      "end": 8
+    }
+  },
+  "action": {
+    "left_arm": {
+      "start": 0,
+      "end": 7
+    },
+    "left_gripper": {
+      "start": 7,
+      "end": 8
+    }
+  },
+  "video": {
+    "head": {
+      "original_key": "observation.images.head_cam_h"
+    },
+    "wrist_left": {
+      "original_key": "observation.images.wrist_cam_l"
+    }
+  },
+  "annotation": {
+    "human.task_description": {
+      "original_key": "task_index"
+    }
+  }
+}

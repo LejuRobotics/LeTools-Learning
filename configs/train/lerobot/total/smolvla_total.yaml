@@ -1,0 +1,114 @@
+dataset:  # 数据集相关设置。
+  repo_id: "lerobot/your_dataset"  # 数据集名字，用来做标识。
+  root: null  # 本地数据路径。
+  episodes: null  # 只训练指定的 episode；不填就是全量。
+  image_transforms: {}  # 额外的图像预处理设置。
+  revision: null  # 远程数据集版本；本地训练一般不用改。
+  use_imagenet_stats: true  # 图像是否用 ImageNet 的均值方差做归一化。
+  video_backend: pyav  # 读视频帧用的后端。一般用 pyav。
+  return_uint8: false  # 是否保留图像为 uint8，而不是转换成 float tensor。
+  streaming: false  # 是否流式读数据。一般保持 false。
+
+training:  # 训练流程设置。
+  output_dir: "outputs/train/smolvla"  # 训练输出目录。
+  job_name: "smolvla"  # 实验名。
+  resume: false  # 是否从 output_dir 最新 checkpoint 继续训；续训改为 true，并修改 output_dir 为上阶段 run 的产物路径，如 outputs/train/smolvla_YYYYMMDD_HHMMSS。
+  seed: 1000  # 随机种子。
+  cudnn_deterministic: false  # 更稳定可复现，但会慢一点。
+  num_workers: 4  # 读数据用的进程数。
+  batch_size: 8  # 每张卡上的 batch size。
+  prefetch_factor: 4  # 每个读数据进程提前准备多少个 batch。
+  persistent_workers: true  # 是否让读数据进程常驻。
+  steps: 30000  # 总训练步数。
+  eval_freq: 5000  # 每隔多少步做一次评测。
+  log_freq: 100  # 每隔多少步打一次日志。
+  tolerance_s: 1.0e-4  # 视频帧和标注对齐时允许的时间误差。
+  save_checkpoint: true  # 是否保存 checkpoint。
+  save_freq: 5000  # 每隔多少步存一次权重。
+  use_policy_training_preset: true  # 是否用模型自带的优化器和调度器默认值。
+  optimizer: null  # 手动指定优化器；一般留空。
+  scheduler: null  # 手动指定学习率策略；一般留空。
+  use_rabc: false  # 是否启用 RABC。一般不用。
+  rabc_progress_path: null  # RABC 用的额外文件路径。一般不用。
+  rabc_kappa: 0.01  # RABC 参数。一般不用改。
+  rabc_epsilon: 1.0e-6  # RABC 的稳定性参数。一般不用改。
+  rabc_head_mode: "sparse"  # RABC 模式。一般不用改。
+  rename_map: {}  # 特征重命名表。一般不用。
+
+eval:  # 训练中评测设置。
+  n_episodes: 50  # 每次评测跑多少条。
+  batch_size: 0  # 评测 batch size。0 表示自动。
+  use_async_envs: true  # 评测环境是否并行异步跑。
+
+wandb:  # wandb 设置。
+  enable: false  # 是否启用 wandb。
+  disable_artifact: false  # 是否禁用向 wandb 上传文件。
+  project: "lerobot"  # wandb 项目名。
+  entity: null  # wandb 账号或团队名。
+  notes: null  # wandb 备注。
+  run_id: null  # wandb run id。
+  mode: null  # wandb 模式。
+  add_tags: true  # 是否自动加 wandb 标签。
+
+peft:  # PEFT / LoRA 微调设置（默认LoRA微调，全量微调请设置 peft: null)
+  method_type: "LORA"  # PEFT 方法。
+  r: 16  # LoRA 低秩矩阵的秩
+  target_modules: null  # null 使用 pi0 默认：gemma_expert 的 q/v_proj + state/action 投影层。
+  full_training_modules: null  # null 使用策略默认 modules_to_save；一般无需改。
+  init_type: null  # LoRA 初始化方式；null 为 PEFT 默认。
+
+policy:  # 模型相关设置。
+  type: "smolvla"  # 模型类型。
+  n_obs_steps: 1  # 一次预测会看几帧观测。
+  input_features: {}  # 手动指定输入特征。一般不用。
+  output_features: {}  # 手动指定输出特征。一般不用。
+  device: "cuda"  # 运行设备。
+  use_amp: false  # 是否启用混合精度。
+  use_peft: false  # 是否启用 PEFT。
+  push_to_hub: false  # 是否上传到 Hugging Face。
+  repo_id: null  # 上传时用的仓库名。
+  private: null  # 上传仓库是否私有。
+  tags: null  # 上传时的标签。
+  license: null  # 上传时的 license。
+  pretrained_path: "lerobot/smolvla_base"  # 官方 SmolVLA 基座（微调默认）；从头训练请改为 null。二阶段微调请改为上一 run 的 <policy_name>_YYYYMMDD_HHMMSS/checkpoints/<step>/pretrained_model 路径。
+  chunk_size: 50  # 每次预测多长的动作序列。
+  n_action_steps: 50  # 每次真正执行多少步动作。
+  normalization_mapping:  # 不同输入的归一化方式。
+    VISUAL: "IDENTITY"  # 图像怎么归一化。
+    STATE: "MEAN_STD"  # 状态怎么归一化。
+    ACTION: "MEAN_STD"  # 动作怎么归一化。
+  max_state_dim: 32  # 状态最大维度。
+  max_action_dim: 32  # 动作最大维度。
+  resize_imgs_with_padding: [512, 512]  # 按比例缩放并补边。
+  empty_cameras: 0  # 预留空相机数量。
+  adapt_to_pi_aloha: false  # 是否适配 ALOHA。
+  use_delta_joint_actions_aloha: false  # ALOHA 模式下是否用关节增量。
+  tokenizer_max_length: 48  # 文本最大长度。
+  num_steps: 10  # 生成步数。
+  use_cache: true  # 是否启用 cache。
+  freeze_vision_encoder: true  # 是否冻结视觉编码器。
+  train_expert_only: true  # 是否只训练动作头。
+  train_state_proj: true  # 是否训练状态投影层。
+  optimizer_lr: 1.0e-4  # 主学习率。
+  optimizer_betas: [0.9, 0.95]  # 优化器 beta 参数。
+  optimizer_eps: 1.0e-8  # 优化器 epsilon。
+  optimizer_weight_decay: 1.0e-10  # weight decay。
+  optimizer_grad_clip_norm: 10  # 梯度裁剪大小。
+  scheduler_warmup_steps: 1000  # warmup 步数。
+  scheduler_decay_steps: 30000  # 学习率衰减步数。
+  scheduler_decay_lr: 2.5e-6  # 衰减后的最小学习率。
+  vlm_model_name: "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # VLM 基座模型。
+  load_vlm_weights: false  # 是否加载预训练 VLM。
+  add_image_special_tokens: false  # 是否插入图像 special token。
+  attention_mode: "cross_attn"  # 注意力模式。
+  prefix_length: -1  # prefix 长度。-1 表示自动。
+  pad_language_to: "longest"  # 语言 padding 策略。
+  num_expert_layers: -1  # expert 层数。-1 表示默认。
+  num_vlm_layers: 16  # 启用的 VLM 层数。
+  self_attn_every_n_layers: 2  # 每几层插一次 self-attention。
+  expert_width_multiplier: 0.75  # expert 宽度倍率。
+  min_period: 4.0e-3  # 最小周期。
+  max_period: 4.0  # 最大周期。
+  rtc_config: null  # 实时控制配置。一般不用。
+  compile_model: false  # 是否启用 torch.compile。
+  compile_mode: "max-autotune"  # compile 模式。

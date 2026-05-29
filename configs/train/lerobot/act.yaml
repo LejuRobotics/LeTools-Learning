@@ -1,0 +1,26 @@
+# LeRobot ACT 简化配置。
+dataset: 
+  repo_id: "lerobot/your_dataset"  # 数据集名字，用来做标识。
+  root: null  # 数据地址
+
+training: 
+  resume: false  # 是否从 output_dir 最新 checkpoint 继续训；续训改为 true，并修改 output_dir 为上阶段 run 的产物路径，如 outputs/train/act_YYYYMMDD_HHMMSS。
+  output_dir: "outputs/train/act" # 权重存储路径
+  job_name: "act"  # 实验名。
+  batch_size: 32  
+  steps: 100000  # 总训练步数
+  save_freq: 20000  # 每N步保存一次权重
+  num_workers: 8  
+  seed: 1000  
+
+wandb:  # wandb的一些设置
+  enable: true  # 是否启用 wandb。
+  project: "lerobot_act"  # wandb 项目名。
+
+policy: 
+  type: "act" 
+  pretrained_path: null  # 从已有 checkpoint 微调时填写。二阶段微调请改为上一 run 的 <policy_name>_YYYYMMDD_HHMMSS/checkpoints/<step>/pretrained_model 路径。 
+  use_amp: false  # 是否启用混合精度。
+  chunk_size: 100  # 每次预测多长的动作序列。
+  n_action_steps: 100  # 每次真正执行多少步动作。
+  temporal_ensemble_coeff: null  # 推理时的时间集成参数。

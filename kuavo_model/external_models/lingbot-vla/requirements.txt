@@ -1,0 +1,11 @@
+ipdb
+torchcodec==0.6.0
+pytest
+datasets==3.6.0
+transformers==4.51.3
+numpy==1.26.4
+tensorboard==2.16.2
+msgpack
+websockets
+matplotlib
+numpydantic

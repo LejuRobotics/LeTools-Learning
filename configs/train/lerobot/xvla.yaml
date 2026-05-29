@@ -1,0 +1,42 @@
+# LeRobot XVLA 简化配置。
+
+dataset:  # 数据集相关设置。
+  repo_id: "lerobot/your_dataset"  # 数据集名字，用来做标识。
+  root: null  # 本地数据路径。
+
+training:  # 训练流程设置。
+  resume: false  # 是否从 output_dir 最新 checkpoint 继续训；续训改为 true，并修改 output_dir 为上阶段 run 的产物路径，如 outputs/train/xvla_YYYYMMDD_HHMMSS。
+  output_dir: "outputs/train/xvla"  # 训练输出目录。
+  job_name: "xvla"  # 实验名。
+  batch_size: 8  # 每张卡上的 batch size。
+  steps: 30000  # 总训练步数。
+  save_freq: 5000  # 每隔多少步存一次权重。
+  log_freq: 100  # 每隔多少步打一次日志。
+  eval_freq: 5000  # 每隔多少步做一次评测。
+  num_workers: 4  # 读数据用的进程数。
+  seed: 1000  # 随机种子。
+
+wandb:  # wandb 设置。
+  enable: false  # 是否启用 wandb。
+  project: "lerobot_xvla"  # wandb 项目名。
+
+policy:  # 模型相关设置；改 chunk_size / max_* / florence_config 请用 total。
+  type: "xvla"  # 模型类型。
+  pretrained_path: "lerobot/xvla-base"  # 官方基座；须与下方 chunk/max 维一致。二阶段微调请改为上一 run 的 <policy_name>_YYYYMMDD_HHMMSS/checkpoints/<step>/pretrained_model 路径。
+  chunk_size: 30  # 与 xvla-base 一致；换 checkpoint 须同步修改。
+  n_action_steps: 30  # 每次执行步数；须不大于 chunk_size。
+  max_state_dim: 20  # 状态 padding 上限。
+  max_action_dim: 20  # 动作 padding 上限。
+  resize_imgs_with_padding: [224, 224]  # 输入图像 H,W；改尺寸须同步 total 中 florence vision 配置。
+  num_image_views: 3  # 期望相机数；不足时用 total 的 empty_cameras 补位。
+  dtype: "float32"  # 计算精度。
+  action_mode: "auto"  # 关节空间用 auto；末端 6D 位姿用 ee6d。
+  num_denoising_steps: 10  # 推理去噪步数（速度/质量权衡）。
+  freeze_vision_encoder: false  # 是否冻结 Florence2 视觉塔。
+  freeze_language_encoder: false  # 是否冻结语言编码器。
+  train_policy_transformer: true  # 是否训练策略 Transformer。
+  train_soft_prompts: true  # 是否训练 soft prompts。
+  optimizer_lr: 1.0e-4  # 主学习率。
+  scheduler_warmup_steps: 1000  # warmup 步数。
+  scheduler_decay_steps: 30000  # 学习率衰减步数（宜与 training.steps 对齐）。
+  scheduler_decay_lr: 2.5e-6  # 衰减后最小学习率。
