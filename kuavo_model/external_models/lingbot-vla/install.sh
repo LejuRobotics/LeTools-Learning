@@ -1,4 +1,4 @@
-pip install https://github.com/huggingface/lerobot/archive/refs/tags/v0.4.2.tar.gz
+pip install https://githubproxy.cc/https://github.com/huggingface/lerobot/archive/refs/tags/v0.4.2.tar.gz
 
 pip install -e .
 pip install -e ./lingbotvla/models/vla/vision_models/lingbot-depth/ --no-deps

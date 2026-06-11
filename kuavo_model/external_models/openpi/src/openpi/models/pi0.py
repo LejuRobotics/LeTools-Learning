@@ -221,6 +221,15 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        prev_chunk_leftover: at.Float[at.Array, "b t ad"] | None = None,
+        inference_delay: int | at.Int[at.Array, ""] = 0,
+        rtc_mode: int | at.Int[at.Array, ""] = 0,
+        rtc_prefix_attention_horizon: int | at.Int[at.Array, ""] = 0,
+        rtc_prefix_attention_schedule: int | at.Int[at.Array, ""] = 3,
+        rtc_max_guidance_weight: float | at.Float[at.Array, ""] = 5.0,
+        rtc_inpainting_overlap_steps: int | at.Int[at.Array, ""] = 0,
+        rtc_inpainting_frozen_steps: int | at.Int[at.Array, ""] = 0,
+        rtc_inpainting_ramp_rate: float | at.Float[at.Array, ""] = 5.0,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -236,28 +245,62 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
-            x_t, time = carry
+        rtc_target = None
+        rtc_weights = None
+        vel_strength = jnp.ones_like(noise)
+        if prev_chunk_leftover is not None:
+            previous = prev_chunk_leftover[:, : self.action_horizon, : self.action_dim]
+            if previous.shape[-1] < self.action_dim:
+                previous = jnp.pad(previous, ((0, 0), (0, 0), (0, self.action_dim - previous.shape[-1])))
+            target = jnp.zeros_like(noise)
+            target = target.at[:, : previous.shape[1], :].set(previous)
+            index = jnp.arange(self.action_horizon)
+
+            overlap = jnp.minimum(jnp.asarray(rtc_inpainting_overlap_steps), previous.shape[1])
+            overlap = jnp.minimum(jnp.maximum(overlap, 0), self.action_horizon)
+            frozen = jnp.minimum(jnp.maximum(jnp.asarray(rtc_inpainting_frozen_steps), jnp.asarray(inference_delay)), overlap)
+            frozen = jnp.maximum(frozen, 0)
+            inpaint_mask = (index < overlap)[None, :, None]
+            noise = jax.lax.cond(
+                jnp.asarray(rtc_mode) == 1,
+                lambda current_noise: jnp.where(inpaint_mask, target, current_noise),
+                lambda current_noise: current_noise,
+                noise,
+            )
+            middle = jnp.maximum(overlap - frozen, 0)
+            frac = (index - frozen + 1).astype(noise.dtype) / (middle.astype(noise.dtype) + 1.0)
+            frac = jnp.clip(frac, 0.0, 1.0)
+            denom = jnp.expm1(jnp.asarray(rtc_inpainting_ramp_rate, dtype=noise.dtype))
+            ramp = jnp.where(
+                denom > 1e-8,
+                jnp.expm1(jnp.asarray(rtc_inpainting_ramp_rate, dtype=noise.dtype) * frac) / denom,
+                frac,
+            )
+            strength = jnp.where(index < frozen, 0.0, jnp.where(index < overlap, ramp, 1.0))
+            vel_strength = strength[None, :, None].astype(noise.dtype)
+
+            end = jnp.minimum(rtc_prefix_attention_horizon, previous.shape[1])
+            start = jnp.minimum(jnp.maximum(inference_delay, 0), end)
+            linear = jnp.clip((start - 1 - index) / (end - start + 1) + 1, 0, 1)
+            linear = jnp.where(index >= end, 0, linear)
+            exp = linear * jnp.expm1(linear) / (jnp.e - 1)
+            zeros = (index < start).astype(noise.dtype)
+            ones = (index < end).astype(noise.dtype)
+            strength = jax.lax.switch(
+                rtc_prefix_attention_schedule,
+                (lambda: zeros, lambda: ones, lambda: linear, lambda: exp),
+            )
+            rtc_target = target
+            rtc_weights = strength[None, :, None].astype(noise.dtype)
+
+        def velocity(x_t, time):
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-            assert full_attn_mask.shape == (
-                batch_size,
-                suffix_tokens.shape[1],
-                prefix_tokens.shape[1] + suffix_tokens.shape[1],
-            )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
+            prefix_suffix_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_suffix_mask, suffix_attn_mask], axis=-1)
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
-
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
                 mask=full_attn_mask,
@@ -266,7 +309,34 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+        def step(carry):
+            x_t, time = carry
+            if rtc_target is not None:
+                def vjp_velocity():
+                    def denoiser(candidate):
+                        v_t = velocity(candidate, time)
+                        return candidate - time * v_t, v_t
+
+                    x1_t, pullback, v_t = jax.vjp(denoiser, x_t, has_aux=True)
+                    error = (rtc_target - x1_t) * rtc_weights
+                    correction = pullback(error)[0]
+                    tau = 1.0 - time
+                    inv_r2 = (time**2 + tau**2) / jnp.maximum(time**2, 1e-8)
+                    guidance_weight = time / jnp.maximum(tau, 1e-8) * inv_r2
+                    guidance_weight = jnp.minimum(
+                        jnp.nan_to_num(guidance_weight, nan=0.0, posinf=rtc_max_guidance_weight),
+                        rtc_max_guidance_weight,
+                    )
+                    return v_t - guidance_weight * correction
+
+                def inpainting_velocity():
+                    return velocity(x_t, time) * vel_strength
+
+                v_t = jax.lax.cond(jnp.asarray(rtc_mode) == 1, inpainting_velocity, vjp_velocity)
+            else:
+                v_t = velocity(x_t, time)
 
             return x_t + dt * v_t, time + dt
 

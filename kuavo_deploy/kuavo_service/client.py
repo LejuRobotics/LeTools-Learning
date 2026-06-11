@@ -224,6 +224,13 @@ class ExternalRobotInferenceClient(BaseInferenceClient):
         if isinstance(response, dict) and response.get("error"):
             raise RuntimeError(f"{response['error']} | request_keys={list(observations.keys())}")
         return response
+
+    def select_action_chunk_rtc(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        response = self.call_endpoint("select_action_chunk_rtc", request)
+        if isinstance(response, dict) and response.get("error"):
+            obs = request.get("observation", {})
+            raise RuntimeError(f"{response['error']} | request_keys={list(obs.keys())}")
+        return response
         
 
 # policy client
@@ -231,6 +238,7 @@ class PolicyClient:
     def __init__(self, host="localhost", port=5555, task_prompt="robot manipulation", api_token=None):
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.task_prompt = str(task_prompt).strip()
+        self._pending_actions: list[torch.Tensor] = []
 
     def eval(self):
         return self
@@ -239,6 +247,7 @@ class PolicyClient:
         return self
 
     def reset(self):
+        self._pending_actions.clear()
         try:
             response = self.policy.reset_server()
             if isinstance(response, dict) and response.get("error"):
@@ -276,9 +285,17 @@ class PolicyClient:
         return payload
 
     def select_action(self, obs_dict):
-        return self._to_action_tensor(self.policy.select_action(self._prepare_obs(obs_dict)))
+        if self._pending_actions:
+            return self._pending_actions.pop(0)
 
-    def select_action_chunk(self, obs_dict):
+        actions = self._fetch_action_chunk(obs_dict)
+        if actions.shape[0] == 0:
+            raise ValueError("Server returned an empty action chunk.")
+
+        self._pending_actions = [actions[i : i + 1] for i in range(1, actions.shape[0])]
+        return actions[0:1]
+
+    def _fetch_action_chunk(self, obs_dict):
         try:
             actions = self.policy.select_action_chunk(self._prepare_obs(obs_dict))
         except RuntimeError as exc:
@@ -287,8 +304,37 @@ class PolicyClient:
             actions = self.policy.select_action(self._prepare_obs(obs_dict))
         return self._to_action_chunk_tensor(actions)
 
+    def select_action_chunk(self, obs_dict):
+        self._pending_actions.clear()
+        return self._fetch_action_chunk(obs_dict)
+
     def predict_action_chunk(self, obs_dict):
         return self.select_action_chunk(obs_dict)
+
+    def select_action_chunk_rtc(
+        self,
+        obs_dict,
+        *,
+        prev_chunk_leftover,
+        inference_delay,
+        execution_horizon,
+        rtc_options,
+    ):
+        self._pending_actions.clear()
+        result = self.policy.select_action_chunk_rtc(
+            {
+                "observation": self._prepare_obs(obs_dict),
+                "prev_chunk_leftover": prev_chunk_leftover,
+                "inference_delay": int(inference_delay),
+                "execution_horizon": int(execution_horizon),
+                "rtc_options": dict(rtc_options),
+            }
+        )
+        if not isinstance(result, dict) or not {"processed_actions", "original_actions"} <= result.keys():
+            raise ValueError("Server RTC result must contain processed_actions and original_actions")
+        result = dict(result)
+        result["processed_actions"] = self._to_action_chunk_tensor(result["processed_actions"])
+        return result
 
 
 # # convert hardware observations to policy's observation dict

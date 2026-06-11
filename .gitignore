@@ -220,12 +220,9 @@ obs.png
 flash*
 
 .codex
-# kuavo_server/
 kuavo_server/skills
-PLAN.md
 .venv/
 .runtime_staging
-preview_portal.py
 kuavo_docs/
 readme_new.md
 kuavo_server/README.md

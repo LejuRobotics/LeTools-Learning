@@ -1742,7 +1742,18 @@ class FlowMatching(nn.Module):
         return losses, loss_depth, depth_preds
     
     def sample_actions(
-        self, images, img_masks, lang_tokens, lang_masks, state, vlm_causal=False, noise=None, num_steps = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        vlm_causal=False,
+        noise=None,
+        num_steps=None,
+        prev_chunk_leftover=None,
+        inference_delay: int = 0,
+        rtc_options: dict | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = state.shape[0]
@@ -1779,14 +1790,98 @@ class FlowMatching(nn.Module):
         dt = torch.tensor(-1.0 / num_steps, dtype=dtype, device=device)
         x_t = noise
         time = torch.tensor(1.0, dtype=dtype, device=device)
+        rtc_target = None
+        rtc_weights = None
+        rtc_max_guidance_weight = None
+        rtc_mode = "vjp"
+        vel_strength = torch.ones_like(x_t)
+        if prev_chunk_leftover is not None and rtc_options and rtc_options.get("enabled", False):
+            rtc_mode = str(rtc_options["mode"])
+            if rtc_mode not in {"vjp", "inpainting"}:
+                raise ValueError(f"Unsupported RTC mode={rtc_mode}")
+            previous = torch.as_tensor(prev_chunk_leftover, device=device, dtype=dtype)
+            if previous.ndim == 2:
+                previous = previous.unsqueeze(0)
+            if previous.ndim != 3:
+                raise ValueError(f"RTC previous actions must be [B, T, D], got {tuple(previous.shape)}")
+            rtc_target = torch.zeros_like(x_t)
+            copy_steps = min(previous.shape[1], x_t.shape[1])
+            copy_dims = min(previous.shape[2], x_t.shape[2])
+            rtc_target[:, :copy_steps, :copy_dims] = previous[:, :copy_steps, :copy_dims]
+
+            overlap = min(max(0, int(rtc_options.get("overlap_steps", copy_steps))), copy_steps)
+            frozen = min(max(int(rtc_options.get("frozen_steps", 0)), int(inference_delay)), overlap)
+            if rtc_mode == "inpainting" and overlap > 0:
+                x_t[:, :overlap, :copy_dims] = previous[:, :overlap, :copy_dims]
+                vel_strength[:, :frozen, :] = 0.0
+                middle = overlap - frozen
+                if middle > 0:
+                    ramp_rate = float(rtc_options.get("ramp_rate", 5.0))
+                    ramp_t = torch.linspace(0.0, 1.0, middle + 2, device=device, dtype=torch.float32)[1:-1]
+                    if ramp_rate > 1e-8:
+                        ramp = 1.0 - torch.exp(-ramp_rate * ramp_t)
+                        ramp = ramp / ramp[-1].clamp_min(1e-8)
+                    else:
+                        ramp = ramp_t
+                    vel_strength[:, frozen:overlap, :] = ramp.to(dtype)[None, :, None]
+
+            start = min(max(0, int(inference_delay)), copy_steps)
+            end = min(max(0, int(rtc_options.get("prefix_attention_horizon", copy_steps))), copy_steps)
+            start = min(start, end)
+            schedule = str(rtc_options.get("prefix_attention_schedule", "exp"))
+            weights = torch.zeros(x_t.shape[1], device=device, dtype=torch.float32)
+            if schedule == "zeros":
+                weights[:start] = 1.0
+            elif schedule == "ones":
+                weights[:end] = 1.0
+            elif schedule in ("linear", "exp"):
+                weights[:start] = 1.0
+                middle = end - start
+                if middle > 0:
+                    ramp = torch.linspace(1.0, 0.0, middle + 2, device=device)[1:-1]
+                    if schedule == "exp":
+                        ramp = ramp * torch.expm1(ramp) / (torch.exp(torch.tensor(1.0, device=device)) - 1.0)
+                    weights[start:end] = ramp
+            else:
+                raise ValueError(f"Unsupported RTC prefix_attention_schedule={schedule}")
+            rtc_weights = weights.to(dtype)[None, :, None]
+            rtc_max_guidance_weight = float(rtc_options.get("max_guidance_weight", 5.0))
         count = 0
         while time >= -dt / 2:
             count += 1
             expanded_time = time.expand(bsize)
 
-            v_t = self.predict_velocity(
-                state, prefix_pad_masks, past_key_values, x_t, expanded_time
-            )
+            if rtc_target is not None and rtc_mode == "vjp":
+                with torch.enable_grad():
+                    guided_x = x_t.detach().requires_grad_(True)
+                    guided_v = self.predict_velocity(
+                        state, prefix_pad_masks, past_key_values, guided_x, expanded_time
+                    )
+                    predicted_clean = guided_x - time * guided_v
+                    error = (rtc_target - predicted_clean) * rtc_weights
+                    correction = torch.autograd.grad(
+                        predicted_clean,
+                        guided_x,
+                        grad_outputs=error.detach(),
+                        retain_graph=False,
+                    )[0]
+                tau = 1.0 - time.float()
+                inv_r2 = (
+                    time.float().square() + tau.square()
+                ) / time.float().square().clamp_min(1e-8)
+                guidance_weight = time.float() / tau.clamp_min(1e-8) * inv_r2
+                guidance_weight = torch.nan_to_num(
+                    guidance_weight,
+                    nan=0.0,
+                    posinf=rtc_max_guidance_weight,
+                ).clamp(max=rtc_max_guidance_weight)
+                v_t = guided_v.detach() - guidance_weight.to(dtype) * correction.detach()
+            else:
+                v_t = self.predict_velocity(
+                    state, prefix_pad_masks, past_key_values, x_t, expanded_time
+                )
+                if rtc_target is not None and rtc_mode == "inpainting":
+                    v_t = v_t * vel_strength
 
             # Euler step
             x_t += dt * v_t

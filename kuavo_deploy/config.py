@@ -201,6 +201,37 @@ class ConfigInference:
     async_low_watermark: int = 4
     async_warmup_actions: int = 1
     async_action_timeout: float = 1.0
+
+    # RTC-Lite (deployment-side queue merging). All fields are no-ops when
+    # rtc_lite_enabled is false or async_inference is false.
+    rtc_lite_enabled: bool = False
+    rtc_lite_merge_mode: str = "blend_replace"
+    rtc_lite_overlap_steps: int = 4
+    rtc_lite_freeze_steps: int = 1
+    rtc_lite_ramp: str = "cosine"
+    rtc_lite_delay_mode: str = "measured"
+    rtc_lite_max_delay_steps: int = 8
+    rtc_lite_keep_min_actions: int = 1
+    rtc_lite_log_deltas: bool = True
+
+    # Full RTC (model-space continuity guidance). This is intentionally
+    # separate from RTC-Lite, which blends already decoded robot actions.
+    rtc_full_enabled: bool = False
+    # Explicit RTC implementation. Choose vjp or inpainting.
+    rtc_full_mode: str = "vjp"
+    # Shared: RTC continuity target length. Inpainting uses it as the
+    # old-action initialization length; VJP uses it as the guidance horizon.
+    rtc_full_overlap_steps: int = 8
+    # VJP-only controls.
+    rtc_full_prefix_attention_schedule: str = "exp"
+    rtc_full_max_guidance_weight: float = 5.0
+    # Inpainting-only controls.
+    rtc_full_frozen_steps: int = 2
+    rtc_full_ramp_rate: float = 5.0
+    # Async queue delay compensation and diagnostics.
+    rtc_full_max_delay_steps: int = 8
+    rtc_full_debug: bool = False
+
     def validate(self):
         supported_policy_types = [
             "",
@@ -220,6 +251,52 @@ class ConfigInference:
             raise ValueError(f"Unsupported policy_type '{self.policy_type}'")
         if self.device not in ["cuda", "cpu"]:
             raise ValueError("device must be 'cuda' or 'cpu'")
+
+        # RTC-Lite validation. Keep the hard rules narrow; the plan flags the
+        # freeze/overlap/keep_min relation as a *recommendation*, not a failure.
+        supported_merge_modes = {"blend_replace"}
+        if self.rtc_lite_merge_mode not in supported_merge_modes:
+            raise ValueError(
+                f"Unsupported rtc_lite_merge_mode '{self.rtc_lite_merge_mode}'. "
+                f"Valid: {sorted(supported_merge_modes)}"
+            )
+        supported_ramps = {"linear", "cosine"}
+        if self.rtc_lite_ramp not in supported_ramps:
+            raise ValueError(
+                f"Unsupported rtc_lite_ramp '{self.rtc_lite_ramp}'. Valid: {sorted(supported_ramps)}"
+            )
+        supported_delay_modes = {"measured"}
+        if self.rtc_lite_delay_mode not in supported_delay_modes:
+            raise ValueError(
+                f"Unsupported rtc_lite_delay_mode '{self.rtc_lite_delay_mode}'. "
+                f"Valid: {sorted(supported_delay_modes)}"
+            )
+        if self.rtc_lite_overlap_steps < 0:
+            raise ValueError("rtc_lite_overlap_steps must be >= 0")
+        if self.rtc_lite_freeze_steps < 0:
+            raise ValueError("rtc_lite_freeze_steps must be >= 0")
+        if self.rtc_lite_keep_min_actions < 0:
+            raise ValueError("rtc_lite_keep_min_actions must be >= 0")
+        if self.rtc_lite_enabled and self.rtc_full_enabled:
+            raise ValueError("rtc_lite_enabled and rtc_full_enabled are mutually exclusive")
+        if self.rtc_full_mode not in {"vjp", "inpainting"}:
+            raise ValueError("rtc_full_mode must be vjp or inpainting")
+        if self.rtc_full_overlap_steps < 0:
+            raise ValueError("rtc_full_overlap_steps must be >= 0")
+        if self.rtc_full_frozen_steps < 0:
+            raise ValueError("rtc_full_frozen_steps must be >= 0")
+        if self.rtc_full_frozen_steps > self.rtc_full_overlap_steps:
+            raise ValueError("rtc_full_frozen_steps must be <= rtc_full_overlap_steps")
+        if self.rtc_full_max_delay_steps < 0:
+            raise ValueError("rtc_full_max_delay_steps must be >= 0")
+        if self.rtc_full_ramp_rate < 0:
+            raise ValueError("rtc_full_ramp_rate must be >= 0")
+        if self.rtc_full_prefix_attention_schedule not in {"zeros", "ones", "linear", "exp"}:
+            raise ValueError("rtc_full_prefix_attention_schedule must be zeros, ones, linear, or exp")
+        if self.rtc_full_max_guidance_weight <= 0:
+            raise ValueError("rtc_full_max_guidance_weight must be > 0")
+        if self.rtc_lite_max_delay_steps < 0:
+            raise ValueError("rtc_lite_max_delay_steps must be >= 0")
 
 
 # -----------------------

@@ -49,7 +49,15 @@ class PolicyPreprocessMixin:
 
     @torch.no_grad
     def select_action(
-        self, observation: dict[str, Tensor], use_bf16: bool = False, noise: Tensor | None = None, num_denoising_step : int = 10
+        self,
+        observation: dict[str, Tensor],
+        use_bf16: bool = False,
+        noise: Tensor | None = None,
+        num_denoising_step: int = 10,
+        return_model_actions: bool = False,
+        prev_chunk_leftover=None,
+        inference_delay: int = 0,
+        rtc_options: dict | None = None,
     ):
         self.eval()
         device = 'cuda'
@@ -69,7 +77,11 @@ class PolicyPreprocessMixin:
             observation['lang_tokens'].unsqueeze(0).to(device=device), 
             observation['lang_masks'].unsqueeze(0).to(device=device), 
             observation['state'].unsqueeze(0).to(dtype=dtype, device=device), 
-            num_steps = num_denoising_step
+            noise=noise,
+            num_steps=num_denoising_step,
+            prev_chunk_leftover=prev_chunk_leftover,
+            inference_delay=inference_delay,
+            rtc_options=rtc_options,
         )
         print('sample action time: ', time.time()-s1)
         
@@ -77,6 +89,8 @@ class PolicyPreprocessMixin:
         if use_bf16:
             observation['state'] = observation['state'].to(dtype=torch.float32)
         data = self.feature_transform.unapply(observation)
+        if return_model_actions:
+            return data, actions.squeeze(0).to(dtype=torch.float32, device='cpu')
         return data
 
 class LingBotVlaInferencePolicy(PolicyPreprocessMixin, LingbotVlaPolicy):
@@ -278,6 +292,57 @@ class LingbotVLAServer:
                 action_length = self.use_length if self.use_length > 0 else output[output_key].shape[0]
                 action_chunk[output_key] = output[output_key][ :action_length,:].float().cpu().numpy()
         self.global_step+=1
+        return action_chunk
+
+    def infer_rtc(
+        self,
+        observation,
+        *,
+        prev_chunk_leftover=None,
+        inference_delay: int = 0,
+        execution_horizon: int | None = None,
+        rtc_options: dict | None = None,
+    ):
+        self.resize_image(observation)
+        for k, v in observation.items():
+            if isinstance(v, np.ndarray):
+                observation[k] = torch.from_numpy(v)
+
+        for action_feature in self.vla.feature_transform.org_features['actions']:
+            if action_feature not in observation:
+                observation[action_feature] = torch.zeros(
+                    self.vla.feature_transform.chunk_size,
+                    observation[self.vla.feature_transform.org_features['states'][0]].shape[0],
+                )
+        first_action_key = self.vla.feature_transform.org_features['actions'][0]
+        observation[first_action_key + '_is_pad'] = torch.zeros(observation[first_action_key].shape[0])
+        observation = self.vla.feature_transform.apply(observation)
+        if self.use_bf16:
+            observation['state'] = observation['state'].to(torch.bfloat16)
+
+        output, model_actions = self.vla.select_action(
+            observation,
+            self.use_bf16,
+            num_denoising_step=self.num_denoising_step,
+            return_model_actions=True,
+            prev_chunk_leftover=prev_chunk_leftover,
+            inference_delay=inference_delay,
+            rtc_options=rtc_options,
+        )
+        action_chunk = {}
+        action_length = None
+        for output_key in output.keys():
+            if output_key in self.vla.feature_transform.org_features['actions']:
+                available = output[output_key].shape[0]
+                # RTC must keep the full model chunk as the reference trajectory
+                # for the following asynchronous inference request.
+                length = available
+                action_chunk[output_key] = output[output_key][:length, :].float().cpu().numpy()
+                action_length = length if action_length is None else min(action_length, length)
+        if action_length is None:
+            raise ValueError("LingBot-VLA RTC inference returned no action features")
+        action_chunk["rtc_original_actions"] = model_actions[:action_length].numpy()
+        self.global_step += 1
         return action_chunk
 
 def main():

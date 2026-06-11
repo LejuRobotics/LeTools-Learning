@@ -399,13 +399,26 @@ class Gr00tPolicy(BasePolicy):
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(self.processor(messages))
 
-        # Step 3: Collate processed inputs into a single batch for model
+        # Step 3: Collate processed inputs into a single batch for model.
+        # RTC operates in normalized model action space, before action decoding.
         collated_inputs = self.collate_fn(processed_inputs)
+        model_options = options
+        if options is not None and options.get("previous_action") is not None:
+            previous_action = np.asarray(options["previous_action"], dtype=np.float32)
+            if previous_action.ndim == 2:
+                previous_action = previous_action[None, ...]
+            if previous_action.ndim != 3:
+                raise ValueError(f"RTC previous_action must be [B, T, D], got {previous_action.shape}")
+            collated_inputs["inputs"]["action"] = torch.from_numpy(previous_action)
+            model_options = {k: v for k, v in options.items() if k != "previous_action"}
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
+        rtc_mode = str(model_options["rtc_mode"]) if model_options is not None and "rtc_mode" in model_options else ""
+        inference_context = torch.no_grad() if rtc_mode == "vjp" else torch.inference_mode()
+
         # Step 4: Run model inference to predict actions
-        with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+        with inference_context:
+            model_pred = self.model.get_action(**collated_inputs, options=model_options)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
@@ -420,7 +433,7 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        return casted_action, {"action": normalized_action.cpu().numpy()}
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.

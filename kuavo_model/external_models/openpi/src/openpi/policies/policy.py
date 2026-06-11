@@ -65,7 +65,16 @@ class Policy(BasePolicy):
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def infer(
+        self,
+        obs: dict,
+        *,
+        noise: np.ndarray | None = None,
+        return_model_actions: bool = False,
+        prev_chunk_leftover: np.ndarray | None = None,
+        inference_delay: int = 0,
+        rtc_options: dict[str, Any] | None = None,
+    ) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -86,6 +95,34 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+        if prev_chunk_leftover is not None:
+            if self._is_pytorch_model:
+                raise RuntimeError("RTC Full is implemented for the OpenPI JAX model only")
+            rtc_options = rtc_options or {}
+            previous = jnp.asarray(prev_chunk_leftover)
+            if previous.ndim == 2:
+                previous = previous[None, ...]
+            schedules = {"zeros": 0, "ones": 1, "linear": 2, "exp": 3}
+            schedule = str(rtc_options.get("prefix_attention_schedule", "exp"))
+            if schedule not in schedules:
+                raise ValueError(f"Unsupported RTC prefix_attention_schedule={schedule}")
+            modes = {"vjp": 0, "inpainting": 1}
+            mode = str(rtc_options["mode"])
+            if mode not in modes:
+                raise ValueError(f"Unsupported RTC mode={mode}")
+            sample_kwargs.update(
+                {
+                    "prev_chunk_leftover": previous,
+                    "inference_delay": int(inference_delay),
+                    "rtc_mode": modes[mode],
+                    "rtc_prefix_attention_horizon": int(rtc_options.get("prefix_attention_horizon", 0)),
+                    "rtc_prefix_attention_schedule": schedules[schedule],
+                    "rtc_max_guidance_weight": float(rtc_options.get("max_guidance_weight", 5.0)),
+                    "rtc_inpainting_overlap_steps": int(rtc_options.get("overlap_steps", 0)),
+                    "rtc_inpainting_frozen_steps": int(rtc_options.get("frozen_steps", 0)),
+                    "rtc_inpainting_ramp_rate": float(rtc_options.get("ramp_rate", 5.0)),
+                }
+            )
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
@@ -99,7 +136,10 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        model_actions = outputs["actions"].copy()
         outputs = self._output_transform(outputs)
+        if return_model_actions:
+            outputs["rtc_original_actions"] = model_actions
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

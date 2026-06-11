@@ -1,8 +1,8 @@
 env:  # 推理环境设置
-  inference_env: sim  # 选仿真还是真机 option: sim/real
-  platform_type: "4pro"  # 机器人型号
-  which_arm: both  # 控制左手、右手还是双手
-  eef_type: rq2f85  # 夹爪或手型类型
+  inference_env: real  # 选仿真还是真机 option: sim/real
+  platform_type: "5w"  # 机器人型号 option: "4pro"/"5"/"5w"
+  which_arm: both  # 控制左手、右手还是双手 option: both/left/right
+  eef_type: qiangnao  # 夹爪或手型类型  option: leju_claw/qiangnao/rq2f85(仿真)
   ros_rate: 10  # 推理频率
   direct_to_wbc: false  # 是否使用direct to wbc模式。
   enable_action_interpolation: true
@@ -15,5 +15,9 @@ inference:  # 推理和评测设置
   pretrained_path: /path/to/checkpoint  # 要加载的权重路径。
   eval_episodes: 10  # 评测跑多少条
   max_episode_steps: 200  # 每条最多跑多少步
+  task_prompt: "Pick and Place"
 
-  task_prompt: "robot manipulation"
+  async_inference: false
+  rtc_lite_enabled: false  # 是否启用 RTC-Lite 队列合并。
+  rtc_full_enabled: false  # 模型空间 RTC；启用时必须关闭 rtc_lite_enabled。
+  rtc_full_mode: vjp  # 可选 vjp / inpainting。

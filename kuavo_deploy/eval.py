@@ -73,7 +73,8 @@ def get_script_paths():
     script_dir = Path(__file__).resolve().parent
     script = script_dir / "src" / "scripts" / "script.py"
     auto_test = script_dir / "src" / "scripts" / "script_auto_test.py"
-    return script_dir, script, auto_test
+    offline_bag_eval = script_dir / "offline_bag_eval.py"
+    return script_dir, script, auto_test, offline_bag_eval
 
 
 def ensure_log_dir(script_dir):
@@ -224,6 +225,7 @@ def print_task_menu(config_path="<config_path>", use_color=True):
         ("go", "普通任务: 先插值到bag第一帧的位置, 再回放bag包前往工作位置"),
         ("run", "普通任务: 从当前位置直接运行模型"),
         ("auto_test", "自动测试任务：仿真中自动测试模型，执行 eval_episodes 次"),
+        ("offline_bag", "离线任务：从一条 bag 读取 obs，跑完整推理链路并和 bag action 做误差验证"),
         ("退出", ""),
     ]
 
@@ -240,6 +242,8 @@ def print_task_menu(config_path="<config_path>", use_color=True):
     print(f"{YELLOW}  python kuavo_deploy/src/scripts/script.py --task <chosen_task> --config {config_path}{RESET}")
     print(f"自动测试任务:{RESET}")
     print(f"{YELLOW}  python kuavo_deploy/src/scripts/script_auto_test.py --task auto_test --config {config_path}{RESET}")
+    print(f"离线bag推理:{RESET}")
+    print(f"{YELLOW}  python kuavo_deploy/offline_bag_eval.py --config {config_path} --bag <bag_path> --plot{RESET}")
 
 
 
@@ -248,7 +252,7 @@ def main():
     global current_proc, LOG_DIR
 
     print_header()
-    script_dir, script, auto_test = get_script_paths()
+    script_dir, script, auto_test, offline_bag_eval = get_script_paths()
     LOG_DIR = ensure_log_dir(script_dir)
 
     if not script.exists():
@@ -256,6 +260,9 @@ def main():
         sys.exit(1)
     if not auto_test.exists():
         print(f"错误: 找不到 script_auto_test.py 文件: {auto_test}")
+        sys.exit(1)
+    if not offline_bag_eval.exists():
+        print(f"错误: 找不到 offline_bag_eval.py 文件: {offline_bag_eval}")
         sys.exit(1)
 
     # print("1. 执行: python script.py --help")
@@ -287,7 +294,7 @@ def main():
     while True:
         print_task_menu(config_path=config_path, use_color=True)
 
-        sub_choice = input("请选择要执行的示例 (1-4): ").strip()
+        sub_choice = input("请选择要执行的示例 (1-5): ").strip()
 
         def start_task(cmd):
             global current_proc
@@ -304,6 +311,15 @@ def main():
         elif sub_choice == "3":
             start_task(["python3", str(auto_test), "--task", "auto_test", "--config", config_path])
         elif sub_choice == "4":
+            bag_path = input("请输入 bag 路径（留空则使用 inference.go_bag_path）: ").strip()
+            # plot_choice = input("是否保存 action 对比曲线？(y/N): ").strip().lower()
+            cmd = ["python3", "-u", str(offline_bag_eval), "--config", config_path, "--log-step-times"]
+            if bag_path:
+                cmd.extend(["--bag", bag_path])
+            # if plot_choice in ("y", "yes"):
+            cmd.append("--plot")
+            start_task(cmd)
+        elif sub_choice == "5":
             print("退出")
             break
         else:

@@ -55,6 +55,28 @@ inference:  # 推理和评测设置。
   async_inference: false  # 是否使用 chunk 异步推理。
   async_control_hz: 0.0  # 异步控制频率，0 表示使用 env.ros_rate。
   async_buffer_size: 50  # action 队列最大长度。
-  async_low_watermark: 3  # 队列剩余动作数小于等于该值时触发下一次 chunk 推理。
+  async_low_watermark: 5  # 队列剩余动作数小于等于该值时触发下一次 chunk 推理。
   async_warmup_actions: 1  # 启动控制线程前至少等待的动作数量。
   async_action_timeout: 1.0  # 控制线程等待新动作的最长时间，超时后停止。
+
+  # RTC-Lite（部署侧 chunk 合并）。仅在 async_inference 且 rtc_lite_enabled 同时为 true 时生效。
+  rtc_lite_enabled: false  # 是否启用 RTC-Lite 队列合并。
+  rtc_lite_overlap_steps: 5  # 新旧 chunk 在边界处线性/余弦混合的步数。
+  rtc_lite_freeze_steps: 1  # 强制保留的旧动作前缀长度，避免下一步动作发生跳变。
+  rtc_lite_ramp: cosine  # 混合权重曲线，可选 linear / cosine
+  rtc_lite_max_delay_steps: 3  # 延迟补偿的上限步数。
+  rtc_lite_keep_min_actions: 1  # 队列可用时至少保留的旧动作数量。
+
+  # RTC Full（模型动作空间内连续性引导）。与 RTC-Lite 互斥，仅用于异步推理。
+  rtc_full_enabled: false
+  rtc_full_mode: vjp  # 可选 vjp / inpainting。
+  rtc_full_overlap_steps: 5  # RTC 连续性目标长度；vjp 约束长度，inpainting 融合长度。
+  rtc_full_max_delay_steps: 8
+  rtc_full_debug: false
+
+  # VJP ONLY
+  rtc_full_prefix_attention_schedule: exp
+  rtc_full_max_guidance_weight: 5.0
+  # INPAINTING ONLY
+  rtc_full_frozen_steps: 2
+  rtc_full_ramp_rate: 5.0

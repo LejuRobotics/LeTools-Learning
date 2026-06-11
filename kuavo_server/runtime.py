@@ -110,6 +110,17 @@ class ModelInferenceServer(BaseInferenceServer):
         self.register_endpoint("reset", adapter.reset, requires_input=False)
         self.register_endpoint("select_action", adapter.select_action, requires_input=True)
         self.register_endpoint("select_action_chunk", adapter.select_action_chunk, requires_input=True)
+        if hasattr(adapter, "select_action_chunk_rtc"):
+            self.register_endpoint("select_action_chunk_rtc", self._select_action_chunk_rtc, requires_input=True)
+
+    def _select_action_chunk_rtc(self, data: dict[str, Any]) -> dict[str, Any]:
+        return self.adapter.select_action_chunk_rtc(
+            data["observation"],
+            prev_chunk_leftover=data.get("prev_chunk_leftover"),
+            inference_delay=int(data.get("inference_delay", 0)),
+            execution_horizon=int(data["execution_horizon"]),
+            rtc_options=dict(data.get("rtc_options", {})),
+        )
 
 
 _ADAPTER_REGISTRY: dict[str, Type[Any]] = {}

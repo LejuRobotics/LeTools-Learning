@@ -135,6 +135,22 @@ class _OpenPiRuntime:
     def infer_chunk(self, obs: dict[str, Any]) -> dict[str, Any]:
         return self.raw_policy.infer(obs)
 
+    def infer_chunk_rtc(
+        self,
+        obs: dict[str, Any],
+        *,
+        prev_chunk_leftover: np.ndarray | None,
+        inference_delay: int,
+        rtc_options: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.raw_policy.infer(
+            obs,
+            return_model_actions=True,
+            prev_chunk_leftover=prev_chunk_leftover,
+            inference_delay=inference_delay,
+            rtc_options=rtc_options,
+        )
+
     def reset(self) -> None:
         self.policy.reset()
 
@@ -361,3 +377,45 @@ class OpenPiJaxLejuAdapter(ModelServerAdapter):
     def select_action_chunk(self, obs: dict[str, Any]) -> np.ndarray:
         self._pending_actions.clear()
         return self._predict_action_chunk(obs)
+
+    def select_action_chunk_rtc(
+        self,
+        obs: dict[str, Any],
+        *,
+        prev_chunk_leftover: np.ndarray | None,
+        inference_delay: int,
+        execution_horizon: int,
+        rtc_options: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._pending_actions.clear()
+        options = dict(rtc_options)
+        mode = str(options["mode"])
+        options["mode"] = mode
+        model_horizon = int(getattr(self.model.config.model, "action_horizon"))
+        target_horizon = max(0, int(options.get("overlap_steps", 0)))
+        options["prefix_attention_horizon"] = min(model_horizon, target_horizon)
+        out = self.model.infer_chunk_rtc(
+            self._build_model_obs(obs),
+            prev_chunk_leftover=prev_chunk_leftover,
+            inference_delay=inference_delay,
+            rtc_options=options,
+        )
+        if not isinstance(out, dict) or "actions" not in out or "rtc_original_actions" not in out:
+            raise ValueError("Unexpected OpenPI RTC model output")
+        native = _to_numpy(out["actions"])
+        original = _to_numpy(out["rtc_original_actions"])
+        if native.ndim == 1:
+            native = native[None, :]
+        if original.ndim == 3 and original.shape[0] == 1:
+            original = original[0]
+        if native.shape[0] != original.shape[0]:
+            raise ValueError(
+                "OpenPI RTC returned misaligned processed/original chunks: "
+                f"{native.shape[0]} and {original.shape[0]}"
+            )
+        processed = np.stack([self._convert_action(step) for step in native], axis=0)
+        return {
+            "processed_actions": processed,
+            "original_actions": original,
+            "metadata": {"backend": f"openpi_jax_rtc_{mode}", "rtc_mode": mode},
+        }

@@ -340,6 +340,10 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
+        rtc_mode = "none"
+        rtc_target = None
+        rtc_weights = None
+        rtc_max_guidance_weight = None
 
         if "action" in action_input:
             # If action in input when doing get action, it means we want to use RTC.
@@ -353,72 +357,133 @@ class Gr00tN1d7ActionHead(nn.Module):
             assert "rtc_frozen_steps" in options, "rtc_frozen_steps is not in options"
             assert "rtc_ramp_rate" in options, "rtc_ramp_rate is not in options"
 
+            rtc_mode = str(options["rtc_mode"])
+            if rtc_mode not in {"vjp", "inpainting"}:
+                raise ValueError(f"Unsupported RTC mode={rtc_mode}")
             action_horizon_before_padding = options["action_horizon"]
-
-            # Use previous action instead of pure noise to do inpainting
-            actions[:, : options["rtc_overlap_steps"], :] = action_input["action"][
+            overlap_steps = options["rtc_overlap_steps"]
+            frozen_steps = options["rtc_frozen_steps"]
+            previous = action_input["action"][
                 :,
-                action_horizon_before_padding
-                - options["rtc_overlap_steps"] : action_horizon_before_padding,
+                action_horizon_before_padding - overlap_steps : action_horizon_before_padding,
                 :,
             ]
-            vel_strength[:, : options["rtc_frozen_steps"], :] = 0.0
-            # NOTE: use an exponential ramp strength to set the remaining unfrozen rtc_steps
-            intermediate_steps = options["rtc_overlap_steps"] - options["rtc_frozen_steps"]
-            # Create exponential ramp from 0 to 1 over intermediate steps
-            t = torch.linspace(0.0, 1.0, intermediate_steps + 2, device=device)
-            ramp = 1 - torch.exp(-options["rtc_ramp_rate"] * t)
-            ramp = ramp / ramp[-1].clamp_min(1e-8)  # normalize to [0,1]
-            ramp = ramp[
-                1:-1
-            ]  # we will only take the middle part of the ramp, ignore the 0.0 and 1.0
-            # Apply ramp to the intermediate steps [batch, intermediate_steps, action_dim]
-            vel_strength[
-                :,
-                options["rtc_frozen_steps"] : options["rtc_overlap_steps"],
-                :,
-            ] = ramp[None, :, None].to(device)
+
+            rtc_target = torch.zeros_like(actions)
+            copy_steps = min(previous.shape[1], actions.shape[1])
+            copy_dims = min(previous.shape[2], actions.shape[2])
+            rtc_target[:, :copy_steps, :copy_dims] = previous[:, :copy_steps, :copy_dims]
+
+            if rtc_mode == "inpainting":
+                # Use previous action instead of pure noise to do inpainting.
+                actions[:, :overlap_steps, :copy_dims] = previous[:, :overlap_steps, :copy_dims]
+                vel_strength[:, :frozen_steps, :] = 0.0
+                # NOTE: use an exponential ramp strength to set the remaining unfrozen rtc_steps
+                intermediate_steps = overlap_steps - frozen_steps
+                # Create exponential ramp from 0 to 1 over intermediate steps
+                t = torch.linspace(0.0, 1.0, intermediate_steps + 2, device=device)
+                ramp = 1 - torch.exp(-options["rtc_ramp_rate"] * t)
+                ramp = ramp / ramp[-1].clamp_min(1e-8)  # normalize to [0,1]
+                ramp = ramp[
+                    1:-1
+                ]  # we will only take the middle part of the ramp, ignore the 0.0 and 1.0
+                # Apply ramp to the intermediate steps [batch, intermediate_steps, action_dim]
+                vel_strength[
+                    :,
+                    frozen_steps : overlap_steps,
+                    :,
+                ] = ramp[None, :, None].to(device)
+
+            schedule = str(options.get("rtc_prefix_attention_schedule", "exp"))
+            end = min(max(0, int(options.get("rtc_prefix_attention_horizon", copy_steps))), copy_steps)
+            start = min(max(0, int(options.get("inference_delay", 0))), end)
+            weights = torch.zeros(actions.shape[1], device=device, dtype=torch.float32)
+            if schedule == "zeros":
+                weights[:start] = 1.0
+            elif schedule == "ones":
+                weights[:end] = 1.0
+            elif schedule in ("linear", "exp"):
+                weights[:start] = 1.0
+                middle = end - start
+                if middle > 0:
+                    guidance_ramp = torch.linspace(1.0, 0.0, middle + 2, device=device)[1:-1]
+                    if schedule == "exp":
+                        guidance_ramp = guidance_ramp * torch.expm1(guidance_ramp) / (
+                            torch.exp(torch.tensor(1.0, device=device)) - 1.0
+                        )
+                    weights[start:end] = guidance_ramp
+            else:
+                raise ValueError(f"Unsupported RTC prefix_attention_schedule={schedule}")
+            rtc_weights = weights.to(actions.dtype)[None, :, None]
+            rtc_max_guidance_weight = float(options.get("rtc_max_guidance_weight", 5.0))
 
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
             t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
             t_discretized = int(t_cont * self.num_timestep_buckets)
 
-            # Embed noised action trajectory.
-            timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device
-            )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Add position embedding.
-            if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                action_features = action_features + pos_embs
-
-            # Join vision, language, state and action embedding along sequence dimension.
-            sa_embs = torch.cat((state_features, action_features), dim=1)
-
-            # Run model forward.
-            if self.config.use_alternate_vl_dit:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                    image_mask=backbone_output.image_mask,
-                    backbone_attention_mask=backbone_output.backbone_attention_mask,
+            def predict_velocity(action_tensor: torch.Tensor) -> torch.Tensor:
+                # Embed noised action trajectory.
+                timesteps_tensor = torch.full(
+                    size=(batch_size,), fill_value=t_discretized, device=device
                 )
+                action_features = self.action_encoder(action_tensor, timesteps_tensor, embodiment_id)
+                # Add position embedding.
+                if self.config.add_pos_embed:
+                    pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+                    pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+                    action_features = action_features + pos_embs
+
+                # Join vision, language, state and action embedding along sequence dimension.
+                sa_embs = torch.cat((state_features, action_features), dim=1)
+
+                # Run model forward.
+                if self.config.use_alternate_vl_dit:
+                    model_output = self.model(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_embeds,
+                        timestep=timesteps_tensor,
+                        image_mask=backbone_output.image_mask,
+                        backbone_attention_mask=backbone_output.backbone_attention_mask,
+                    )
+                else:
+                    model_output = self.model(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_embeds,
+                        timestep=timesteps_tensor,
+                    )
+                pred = self.action_decoder(model_output, embodiment_id)
+                return pred[:, -self.action_horizon :]
+
+            if rtc_target is not None and rtc_mode == "vjp":
+                with torch.enable_grad():
+                    guided_actions = actions.detach().requires_grad_(True)
+                    guided_velocity = predict_velocity(guided_actions)
+                    predicted_clean = guided_actions + (1.0 - t_cont) * guided_velocity
+                    error = (rtc_target - predicted_clean) * rtc_weights
+                    correction = torch.autograd.grad(
+                        predicted_clean,
+                        guided_actions,
+                        grad_outputs=error.detach(),
+                        retain_graph=False,
+                    )[0]
+                time = torch.tensor(1.0 - t_cont, dtype=actions.dtype, device=device)
+                tau = torch.tensor(t_cont, dtype=torch.float32, device=device)
+                inv_r2 = (time.float().square() + tau.square()) / time.float().square().clamp_min(1e-8)
+                guidance_weight = time.float() / tau.clamp_min(1e-8) * inv_r2
+                guidance_weight = torch.nan_to_num(
+                    guidance_weight,
+                    nan=0.0,
+                    posinf=rtc_max_guidance_weight,
+                ).clamp(max=rtc_max_guidance_weight)
+                pred_velocity = guided_velocity.detach() + guidance_weight.to(actions.dtype) * correction.detach()
             else:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                )
-            pred = self.action_decoder(model_output, embodiment_id)
-
-            pred_velocity = pred[:, -self.action_horizon :]
+                pred_velocity = predict_velocity(actions)
+                if rtc_target is not None and rtc_mode == "inpainting":
+                    pred_velocity = pred_velocity * vel_strength
 
             # Update actions using euler integration.
-            actions = actions + dt * pred_velocity * vel_strength
+            actions = actions + dt * pred_velocity
 
         return BatchFeature(
             data={

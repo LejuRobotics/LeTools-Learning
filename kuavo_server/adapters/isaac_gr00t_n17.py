@@ -175,6 +175,38 @@ class _Gr00tRuntime:
         actions, _ = self.policy.get_action(observation)
         return actions
 
+    def infer_rtc(
+        self,
+        observation: dict[str, Any],
+        *,
+        prev_chunk_leftover: np.ndarray | None,
+        inference_delay: int,
+        rtc_options: dict[str, Any],
+    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        options: dict[str, Any] | None = None
+        if prev_chunk_leftover is not None and len(prev_chunk_leftover) > 0:
+            mode = str(rtc_options["mode"])
+            if mode not in {"vjp", "inpainting"}:
+                raise ValueError(f"Unsupported GR00T RTC mode={mode}")
+            available = int(prev_chunk_leftover.shape[0])
+            overlap = min(int(rtc_options["overlap_steps"]), available)
+            frozen = min(max(int(rtc_options["frozen_steps"]), int(inference_delay)), overlap)
+            previous = np.asarray(prev_chunk_leftover[:overlap], dtype=np.float32)
+            options = {
+                "rtc_mode": mode,
+                "previous_action": previous,
+                "action_horizon": overlap,
+                "rtc_overlap_steps": overlap,
+                "rtc_frozen_steps": frozen,
+                "rtc_ramp_rate": float(rtc_options["ramp_rate"]),
+                "inference_delay": int(inference_delay),
+                "rtc_prefix_attention_horizon": overlap,
+                "rtc_prefix_attention_schedule": str(rtc_options.get("prefix_attention_schedule", "exp")),
+                "rtc_max_guidance_weight": float(rtc_options.get("max_guidance_weight", 5.0)),
+            }
+        actions, info = self.policy.get_action(observation, options)
+        return actions, np.asarray(info["action"])[0]
+
     def reset(self) -> None:
         self.policy.reset()
 
@@ -498,3 +530,41 @@ class IsaacGr00tN17Adapter(ModelServerAdapter):
         if self.execution_horizon is not None:
             action_chunk = action_chunk[:self.execution_horizon]
         return np.stack([np.asarray(step) for step in action_chunk], axis=0)
+
+    def select_action_chunk_rtc(
+        self,
+        obs: dict[str, Any],
+        *,
+        prev_chunk_leftover: np.ndarray | None,
+        inference_delay: int,
+        execution_horizon: int,
+        rtc_options: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._pending_actions.clear()
+        action_dict, original_chunk = self.model.infer_rtc(
+            self._build_model_obs(obs),
+            prev_chunk_leftover=prev_chunk_leftover,
+            inference_delay=inference_delay,
+            rtc_options=rtc_options,
+        )
+        processed = self._convert_action_chunk(action_dict)
+        if not processed or original_chunk.shape[0] <= 0:
+            raise ValueError("Isaac-GR00T-N17 returned empty RTC action chunk.")
+        processed_len = len(processed)
+        original = np.asarray(original_chunk)
+        if original.shape[0] < processed_len:
+            raise ValueError(
+                "Isaac-GR00T-N17 RTC returned misaligned processed/original chunks: "
+                f"{processed_len} and {original.shape[0]}"
+            )
+        mode = str(rtc_options["mode"])
+        return {
+            "processed_actions": np.stack(processed, axis=0),
+            "original_actions": original[:processed_len],
+            "metadata": {
+                "backend": f"groot_rtc_{mode}",
+                "rtc_mode": mode,
+                "raw_model_horizon": int(original.shape[0]),
+                "valid_action_horizon": int(processed_len),
+            },
+        }

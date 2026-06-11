@@ -325,3 +325,43 @@ class LingBotVlaAdapter(ModelServerAdapter):
     def select_action_chunk(self, obs: dict[str, Any]) -> np.ndarray:
         self._pending_actions.clear()
         return self._infer_chunk(obs)
+
+    def select_action_chunk_rtc(
+        self,
+        obs: dict[str, Any],
+        *,
+        prev_chunk_leftover: np.ndarray | None,
+        inference_delay: int,
+        execution_horizon: int,
+        rtc_options: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._pending_actions.clear()
+        options = dict(rtc_options)
+        mode = str(options["mode"])
+        options["mode"] = mode
+        model_horizon = int(
+            getattr(self.model.vla.model.config, "n_action_steps", self.model.config.chunk_size)
+        )
+        target_horizon = max(0, int(options.get("overlap_steps", 0)))
+        options["prefix_attention_horizon"] = min(model_horizon, target_horizon)
+        out = self.model.infer_rtc(
+            self._build_model_obs(obs),
+            prev_chunk_leftover=prev_chunk_leftover,
+            inference_delay=inference_delay,
+            execution_horizon=execution_horizon,
+            rtc_options=options,
+        )
+        if not isinstance(out, dict) or "action" not in out or "rtc_original_actions" not in out:
+            raise ValueError("Unexpected LingBot-VLA RTC model output")
+        processed = self._convert_action_chunk(out["action"])
+        original = _to_numpy(out["rtc_original_actions"])
+        if processed.shape[0] != original.shape[0]:
+            raise ValueError(
+                "LingBot-VLA RTC returned misaligned processed/original chunks: "
+                f"{processed.shape[0]} and {original.shape[0]}"
+            )
+        return {
+            "processed_actions": processed,
+            "original_actions": original,
+            "metadata": {"backend": f"lingbot_rtc_{mode}", "rtc_mode": mode},
+        }
