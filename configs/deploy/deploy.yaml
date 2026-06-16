@@ -7,6 +7,7 @@ env:  # 推理环境设置
   direct_to_wbc: false  # 是否使用direct to wbc模式。
   enable_action_interpolation: true
   control_rate: 100  # WBC插值后的实际控制指令频率
+  image_size: [848, 480]  # 相机缩放尺寸 option: [640, 480](仿真)/[848, 480](真机）
   
 
 inference:  # 推理和评测设置

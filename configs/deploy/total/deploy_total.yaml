@@ -5,6 +5,7 @@ env:  # 推理环境设置。
   platform_type: "4pro"  # 机器人型号。
   control_mode: joint  # 控制方式。
   which_arm: both  # 控制左手、右手还是双手。
+  head_init: [0, 12]  # 仿真中使用的头部初始角度 [yaw, pitch]。真机不会使用此角度。
 
   ros_rate: 10  # ROS 运行频率。
   direct_to_wbc: false  # 是否直接发给 WBC。
