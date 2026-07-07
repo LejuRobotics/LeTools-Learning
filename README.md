@@ -1,6 +1,6 @@
 <div align="center">
 
-<h1 align="center">Kuavo Learning Studio</h1>
+<h1 align="center">LeTools-Learning</h1>
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
@@ -8,7 +8,7 @@
 [![ROS](https://img.shields.io/badge/ROS-Noetic-22314E.svg)](http://wiki.ros.org/noetic)
 [![Leju](https://img.shields.io/badge/Leju-Robotics-orange)](https://www.lejurobot.com/zh)
 
-📖 [完整文档](https://www.kuavolearningstudio.lejurobot.com)
+📖 [完整文档](https://www.letools.lejurobot.com)
 
 </div>
 
@@ -47,15 +47,15 @@
 **1. 克隆仓库**
 
 ```bash
-git clone https://github.com/LejuRobotics/kuavo_learning_studio.git
-cd kuavo_learning_studio
+git clone https://github.com/LejuRobotics/LeTools-Learning.git
+cd LeTools-Learning
 ```
 
 **2. 创建环境**
 
 ```bash
-conda create -n kls_dev python=3.12
-conda activate kls_dev
+conda create -n letools python=3.12
+conda activate letools
 ```
 
 **3. 一键安装依赖**
@@ -66,7 +66,7 @@ chmod +x setup_env.sh
 bash setup_env.sh
 ```
 
-> 📘 完整安装步骤见 [安装指南](https://www.kuavolearningstudio.lejurobot.com/docs.html#get_started/installation.md)
+> 📘 完整安装步骤见 [安装指南](https://www.letools.lejurobot.com/docs.html#get_started/installation.md)
 
 ---
 
@@ -93,7 +93,7 @@ dataset:
 python kuavo_data/CvtRosbag2Lerobot.py
 ```
 
-> 输出目录：`/path/to/output_parent/lerobot` · 详情见 [数据准备](https://www.kuavolearningstudio.lejurobot.com/docs.html#tutorials/data_preparation.md)
+> 输出目录：`/path/to/output_parent/lerobot` · 详情见 [数据准备](https://www.letools.lejurobot.com/docs.html#tutorials/data_preparation.md)
 
 ---
 
@@ -136,7 +136,7 @@ python kuavo_model/train.py --policy act
 
 </details>
 
-> 📘 更多说明见 [LeRobot 模型训练](https://www.kuavolearningstudio.lejurobot.com/docs.html#tutorials/lerobot_training.md) · [原生模型训练](https://www.kuavolearningstudio.lejurobot.com/docs.html#tutorials/model_training.md)
+> 📘 更多说明见 [LeRobot 模型训练](https://www.letools.lejurobot.com/docs.html#tutorials/lerobot_training.md) · [原生模型训练](https://www.letools.lejurobot.com/docs.html#tutorials/model_training.md)
 
 ---
 
@@ -175,7 +175,7 @@ python kuavo_deploy/eval.py
 
 </details>
 
-> 📘 详情见 [推理与部署](https://www.kuavolearningstudio.lejurobot.com/docs.html#tutorials/inference.md)
+> 📘 详情见 [推理与部署](https://www.letools.lejurobot.com/docs.html#tutorials/inference.md)
 
 ---
 
@@ -203,14 +203,14 @@ python kuavo_deploy/eval.py
 
 | 主题           | 文档                                                                                               |
 | ------------ | ------------------------------------------------------------------------------------------------ |
-| 项目介绍         | [查看文档](https://www.kuavolearningstudio.lejurobot.com/docs.html#get_started/intro.md)          |
-| 安装指南         | [查看文档](https://www.kuavolearningstudio.lejurobot.com/docs.html#get_started/installation.md)   |
-| 快速开始         | [查看文档](https://www.kuavolearningstudio.lejurobot.com/docs.html#tutorials/quick_start.md)      |
-| 数据准备         | [查看文档](https://www.kuavolearningstudio.lejurobot.com/docs.html#tutorials/data_preparation.md) |
-| LeRobot 模型训练 | [查看文档](https://www.kuavolearningstudio.lejurobot.com/docs.html#tutorials/lerobot_training.md) |
-| 外挂模型训练       | [查看文档](https://www.kuavolearningstudio.lejurobot.com/docs.html#tutorials/model_training.md)   |
-| 推理与部署        | [查看文档](https://www.kuavolearningstudio.lejurobot.com/docs.html#tutorials/inference.md)        |
-| 新策略拓展        | [查看文档](https://www.kuavolearningstudio.lejurobot.com/docs.html#tutorials/bring_policies.md)   |
+| 项目介绍         | [查看文档](https://www.letools.lejurobot.com/docs.html#get_started/intro.md)          |
+| 安装指南         | [查看文档](https://www.letools.lejurobot.com/docs.html#get_started/installation.md)   |
+| 快速开始         | [查看文档](https://www.letools.lejurobot.com/docs.html#tutorials/quick_start.md)      |
+| 数据准备         | [查看文档](https://www.letools.lejurobot.com/docs.html#tutorials/data_preparation.md) |
+| LeRobot 模型训练 | [查看文档](https://www.letools.lejurobot.com/docs.html#tutorials/lerobot_training.md) |
+| 外挂模型训练       | [查看文档](https://www.letools.lejurobot.com/docs.html#tutorials/model_training.md)   |
+| 推理与部署        | [查看文档](https://www.letools.lejurobot.com/docs.html#tutorials/inference.md)        |
+| 新策略拓展        | [查看文档](https://www.letools.lejurobot.com/docs.html#tutorials/bring_policies.md)   |
 
 
 
@@ -221,17 +221,17 @@ python kuavo_deploy/eval.py
 
 | 我想要...           | 推荐渠道                                                                                                                   |
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| 报告 Bug 或运行时报错    | [GitHub Issues](https://github.com/LejuRobotics/kuavo_learning_studio/issues/new?labels=bug)（请附环境信息、复现步骤、完整 traceback） |
-| 提交新功能建议 / 模型接入需求 | [GitHub Issues](https://github.com/LejuRobotics/kuavo_learning_studio/issues/new?labels=enhancement)                   |                   |
-| 国内用户交流群          | QQ 群 / 微信群入群方式见 [社区交流](https://www.kuavolearningstudio.lejurobot.com/docs.html#troubleshooting/community.md)        |
+| 报告 Bug 或运行时报错    | [GitHub Issues](https://github.com/LejuRobotics/LeTools-Learning/issues/new?labels=bug)（请附环境信息、复现步骤、完整 traceback） |
+| 提交新功能建议 / 模型接入需求 | [GitHub Issues](https://github.com/LejuRobotics/LeTools-Learning/issues/new?labels=enhancement)                   |                   |
+| 国内用户交流群          | QQ 群 / 微信群入群方式见 [社区交流](https://www.letools.lejurobot.com/docs.html#troubleshooting/community.md)        |
 | 项目合作 / 企业级支持     | [lejurobot@lejurobot.com](mailto:lejurobot@lejurobot.com)                                                              |
 
 
 **提交 Issue 前请先：**
 
-1. 搜索 [已有 Issues](https://github.com/LejuRobotics/kuavo_learning_studio/issues?q=is%3Aissue) 和 [常见问题 FAQ](https://www.kuavolearningstudio.lejurobot.com/docs.html#troubleshooting/faq.md)，避免重复。
-2. 阅读 [贡献指南](https://github.com/LejuRobotics/kuavo_learning_studio/blob/main/CONTRIBUTING.md) 了解分支策略与 PR 流程。
-3. 使用对应的 [Issue 模板](https://github.com/LejuRobotics/kuavo_learning_studio/issues/new/choose)，填全环境与复现信息。
+1. 搜索 [已有 Issues](https://github.com/LejuRobotics/LeTools-Learning/issues?q=is%3Aissue) 和 [常见问题 FAQ](https://www.letools.lejurobot.com/docs.html#troubleshooting/faq.md)，避免重复。
+2. 阅读 [贡献指南](https://github.com/LejuRobotics/LeTools-Learning/blob/main/CONTRIBUTING.md) 了解分支策略与 PR 流程。
+3. 使用对应的 [Issue 模板](https://github.com/LejuRobotics/LeTools-Learning/issues/new/choose)，填全环境与复现信息。
 
 **响应预期：** 本项目由乐聚机器人算法团队在工作时间维护。我们会尽力响应所有公开渠道的反馈，但**不对修复时间作正式 SLA 承诺**；如需企业级保障，请走商业合作邮箱。
 

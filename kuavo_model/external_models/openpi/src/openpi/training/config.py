@@ -776,7 +776,7 @@ _CONFIGS = [
         # Also modify the DataConfig to use the new config you made for your dataset above.
         data=LeRobotKuavoDataConfig(
             repo_id="test-sim",
-            root="/media/ruichen/5fe8ed68-6ff6-464f-af10-a89b65c040cf/sim/test_task1/task1_test/",
+            root="/path/to/dataset/",
             base_config=DataConfig(
                 # This flag determines whether we load the prompt (i.e. the task instruction) from the
                 # ``task`` field in the LeRobot dataset. If set to True, the prompt will show up in
