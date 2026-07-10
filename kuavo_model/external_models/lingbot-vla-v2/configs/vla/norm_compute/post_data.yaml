@@ -1,0 +1,15 @@
+data:
+  datasets_type: vla
+  data_name: multi
+  robot_name: 
+  train_path: 
+  robot_config_root: configs/robot_configs
+  norm_path: 
+  num_workers: 8
+  prompt_type: global
+  
+
+train:
+  micro_batch_size: 48
+  output_dir: ''
+  max_steps: 100000000000000

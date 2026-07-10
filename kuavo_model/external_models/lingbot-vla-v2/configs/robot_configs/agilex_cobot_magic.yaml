@@ -1,0 +1,20 @@
+states:
+  - observation.state.arm.position:
+      origin_keys: observation.state.arm.position
+  - observation.state.effector.position:
+      origin_keys: observation.state.effector.position
+
+actions:
+  - action.arm.position:
+      origin_keys: action.arm.position
+      subtract_state: true
+  - action.effector.position:
+      origin_keys: action.effector.position
+      subtract_state: false
+
+images:
+  - observation.images.camera_top
+  - observation.images.camera_wrist_left
+  - observation.images.camera_wrist_right
+
+norm_stats: assets/norm_stats/example.json

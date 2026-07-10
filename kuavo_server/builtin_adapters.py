@@ -6,6 +6,7 @@ import importlib
 
 ADAPTER_MODULES: dict[str, str] = {
     "lingbot_vla": "kuavo_server.adapters.lingbot_vla",
+    "lingbot_vla_v2": "kuavo_server.adapters.lingbot_vla_v2",
     "openpi": "kuavo_server.adapters.openpi",
     "wall_x": "kuavo_server.adapters.wall_x",
     "isaac_gr00t": "kuavo_server.adapters.isaac_gr00t",

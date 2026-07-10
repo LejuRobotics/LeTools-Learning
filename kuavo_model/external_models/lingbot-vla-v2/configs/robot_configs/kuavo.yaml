@@ -1,0 +1,48 @@
+states:
+  - observation.state.arm.position:
+      origin_keys:
+        - observation.state:
+            start: 0
+            end: 7
+        - observation.state:
+            start: 8
+            end: 15
+  - observation.state.effector.position:
+      origin_keys:
+        - observation.state:
+            start: 7
+            end: 8
+        - observation.state:
+            start: 15
+            end: 16
+
+actions:
+  - action.arm.position:
+      origin_keys:
+        - action:
+            start: 0
+            end: 7
+        - action:
+            start: 8
+            end: 15
+    #   relative_type: delta  # uncommment if subtract_state is true
+      subtract_state: false
+  - action.effector.position:
+      origin_keys:
+        - action:
+            start: 7
+            end: 8
+        - action:
+            start: 15
+            end: 16
+      subtract_state: false
+
+images:
+  - observation.images.head_cam_h:
+      origin_keys: observation.images.head_cam_h
+  - observation.images.wrist_cam_l:
+      origin_keys: observation.images.wrist_cam_l
+  - observation.images.wrist_cam_r:
+      origin_keys: observation.images.wrist_cam_r
+
+norm_stats: assets/norm_stats/kuavo.json

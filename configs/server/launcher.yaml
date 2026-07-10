@@ -4,6 +4,7 @@
 #   python kuavo_server/launch.py openpi
 #   python kuavo_server/launch.py groot
 #   python kuavo_server/launch.py lingbotvla
+#   python kuavo_server/launch.py lingbotvla2
 #
 # 启动器会读取下面对应 adapter 的 env 段（决定怎么进入环境：uv / conda / 当前 shell）
 # 与 args 段（serve.py 的命令行参数），自动拼出原命令并 exec 运行。
@@ -77,3 +78,23 @@ adapters:
       use_compile: false                                      # torch.compile
       use_fp32: false                                         # true 时用 fp32（默认 bf16）
       model_repo_root: ""                                     # 留空 -> external_models/lingbot-vla
+
+  # ============================================================
+  # LingBot-VLA v2
+  # ============================================================
+  lingbotvla2:
+    adapter: lingbot_vla_v2
+    env:
+      mode: conda
+      conda_env: lingbotvla2
+    args:
+      checkpoint: /path/to/lingbot-vla-v2/hf_ckpt/model       # 必填：包含 *.safetensors 的目录
+      training_config_path: ""                                # 留空 -> configs/vla/kuavo/kuavo_real_depth.yaml
+      qwen3vl_path: /path/to/Qwen3-VL-4B-Instruct             # 可留空，使用训练 YAML 中的 model.tokenizer_path
+      robot_norm_path: /path/to/kuavo_norm.json               # 必填：Kuavo norm stats JSON
+      robot_config_path: ""                                   # 留空 -> kuavo_server/configs/lingbotvla_v2/kuavo.yaml
+      which_arm: both
+      execution_horizon: 25                                   # -1 返回模型完整 chunk
+      use_compile: false                                      # torch.compile
+      use_fp32: false                                         # true 时用 fp32（默认 bf16）
+      model_repo_root: ""                                     # 留空 -> external_models/lingbot-vla-v2

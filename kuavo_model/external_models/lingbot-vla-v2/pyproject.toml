@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lingbotvla"
+dynamic = ["dependencies", "optional-dependencies"]
+version = "0.0.1"
+authors = [
+  { name="Robbyant Team"},
+]
+description = "From Foundation to Application: Improving VLA Models in Practice"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+[tool.ruff]
+target-version = "py38"
+line-length = 119
+indent-width = 4
+
+[tool.ruff.lint]
+ignore = ["C901", "E501", "E741", "W605", "C408"]
+select = ["C", "E", "F", "I", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401", "F403", "F811"]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+known-first-party = ["lingbotvla"]
+known-third-party = ["torch", "transformers", "wandb"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

@@ -115,7 +115,27 @@ If the external repo already exposes a stable policy wrapper but still mixes
 checkpoint-local and YAML-relative paths, resolve those paths inside the
 adapter instead of relying on cwd. `wall_x.py` shows this pattern.
 
-### Step 6: Add launch docs
+### Step 6: Add launcher support
+
+Update `configs/server/launcher.yaml` with a block for the new model. The block
+should declare:
+
+- the short launcher name users type after `kuavo_server/launch.py`
+- `adapter: <registered_adapter_name>` when the short name differs from the
+  adapter name
+- the model environment (`uv`, `conda`, or `none`)
+- all adapter CLI args, with empty strings for values that should use adapter
+  defaults
+
+Update `kuavo_server/launch.py` when its user-facing help text or documented
+shortcut list should mention the new alias. Validate with:
+
+```bash
+python kuavo_server/launch.py --list
+python kuavo_server/launch.py <shortcut> --dry-run
+```
+
+### Step 7: Add launch docs
 
 Update:
 
@@ -129,16 +149,18 @@ Document:
 - repo-specific assumptions
 - known shape/path quirks
 
-### Step 7: Validate
+### Step 8: Validate
 
 Validation order:
 
 1. adapter import succeeds
 2. `serve.py --help` shows the adapter
-3. adapter dry run works if implemented
-4. server boots and prints the listening endpoint
-5. `kuavo_deploy` client can connect
-6. one full sim workflow completes
+3. `launch.py --list` shows the shortcut
+4. `launch.py <shortcut> --dry-run` prints the expected environment command
+5. adapter dry run works if implemented
+6. server boots and prints the listening endpoint
+7. `kuavo_deploy` client can connect
+8. one full sim workflow completes
 
 ## Common Failure Modes
 

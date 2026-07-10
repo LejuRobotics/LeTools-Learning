@@ -1,0 +1,832 @@
+import json
+import os
+import re
+import time
+from dataclasses import asdict, dataclass, field
+from functools import partial
+from io import BytesIO
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Literal
+from collections import defaultdict
+import torch
+import torch.distributed as dist
+import wandb
+from PIL import Image
+from tqdm import trange
+from torch.utils.tensorboard import SummaryWriter
+from lingbotvla.checkpoint import build_checkpointer, ckpt_to_state_dict
+from lingbotvla.data import (
+    OmniDataCollatorWithPacking,
+    OmniDataCollatorWithPadding,
+    OmniSequenceShardCollator,
+    VLADataCollatorWithPacking,
+    build_dataloader,
+    build_iterative_dataset,
+    build_mapping_dataset,
+    build_vla_dataset,
+    build_multimodal_chat_template,
+)
+from lingbotvla.data.constants import IMAGE_INPUT_INDEX
+from lingbotvla.data.multimodal.preprocess import conv_preprocess
+from lingbotvla.distributed.offloading import build_activation_offloading_context
+from lingbotvla.distributed.parallel_state import get_parallel_state, init_parallel_state
+from lingbotvla.distributed.torch_parallelize import build_parallelize_model
+from lingbotvla.models import build_foundation_model, build_processor, save_model_assets, save_model_weights, build_tokenizer
+from lingbotvla.optim import build_lr_scheduler, build_optimizer
+from lingbotvla.utils import helper
+from lingbotvla.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
+from lingbotvla.utils.dist_utils import all_reduce
+
+from lingbotvla.models.vla.vision_models.module_utils import build_depth_model, get_depth_target, log_depth
+
+if TYPE_CHECKING:
+    from transformers import ProcessorMixin
+
+    from lingbotvla.data.chat_template import ChatTemplate
+
+
+logger = helper.create_logger(__name__)
+# try:
+#     from aistudio_tracking import training_tracking as wandb
+# except Exception as e:
+#     logger.info_rank0(f"Failed to import aistudio_tracking: {repr(e)}.")
+
+MAX_PIXELS = 768 * 28 * 28
+ROLE_MAPPING = {
+    "human": "user",
+    "gpt": "assistant",
+}
+
+def process_sample(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    chat_template: "ChatTemplate",
+    position_id_func: "Callable",
+    data_root: str,
+    **kwargs,
+):
+    """
+    Processes multimodal example with qwen2vl's pre-processor.
+    """
+    source = (
+        kwargs["source_name"] if "source_name" in kwargs else sample["source"]
+    )  # source_name if use multisource_dataset
+    conversations = sample["conversations"] if "conversations" in sample else sample["text"]  # text-only data
+    conversations = conv_preprocess(source, conversations, **kwargs)
+
+    token_num_inputs, image_inputs = {}, {}
+    image_grid_thw = None
+    if "image" in sample:
+        images = []
+        with open(os.path.join(data_root,sample["image"]), 'rb') as f:
+            images.append(Image.open(f).convert("RGB"))
+
+        image_inputs = processor.image_processor(images=images, return_tensors="pt")
+        image_grid_thw = image_inputs["image_grid_thw"]
+        merge_length = processor.image_processor.merge_size**2
+        image_token_num = image_grid_thw.prod(dim=-1) // merge_length
+        token_num_inputs["image"] = image_token_num
+    tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
+    tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
+    input_ids = tokenized_example["input_ids"]
+
+    position_ids = position_id_func(
+        input_ids=input_ids.unsqueeze(0),
+        image_grid_thw=image_grid_thw,
+        attention_mask=tokenized_example["attention_mask"].unsqueeze(0),
+    )["position_ids"]
+    tokenized_example["position_ids"] = position_ids.squeeze()  # (dim, l)
+
+    tokenized_example["image_mask"] = tokenized_example["input_ids"] == IMAGE_INPUT_INDEX
+    tokenized_example["input_ids"][tokenized_example["image_mask"]] = 0
+    tokenized_example.update(image_inputs)
+    return [tokenized_example]
+
+
+def get_param_groups(model: "torch.nn.Module", default_lr: float, vit_lr: float):
+    vit_params, other_params = [], []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if "visual" in name:
+                vit_params.append(param)
+            else:
+                other_params.append(param)
+
+    return [{"params": vit_params, "lr": vit_lr}, {"params": other_params, "lr": default_lr}]
+
+
+@dataclass
+class MyTrainingArguments(TrainingArguments):
+    freeze_vit: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to freeze the vit parameters."},
+    )
+    vit_lr: float = field(
+        default=1e-6,
+        metadata={"help": "Maximum learning rate for vit parameters."},
+    )
+    freeze_vision_encoder: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to freeze the vision encoder in PI0 model."},
+    )
+    tokenizer_max_length: int = field(
+        default=48,
+        metadata={"help": "Maximum length of the tokenizer."},
+    )
+    enable_expert_vision: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable expert vision."},
+    )
+    expert_vision_type: str | None = field(
+        default=None,
+        metadata={"help": "Type of expert vision. Currently only support vit."},
+    )
+    expert_vision_path: str | None = field(
+        default=None,
+        metadata={"help": "Path to expert vision model."},
+    )
+    action_dim: int = field(
+        default=7,
+        metadata={"help": "Action dimension."},
+    )
+    max_action_dim: int = field(
+        default=32,
+        metadata={"help": "Action dimension after padding."},
+    )
+    max_state_dim: int = field(
+        default=32,
+        metadata={"help": "State dimension after padding."},
+    )
+    chunk_size: int = field(
+        default=50,
+        metadata={"help": "Chunk size of action."},
+    )
+    vlm_causal: bool = field(
+        default=False,
+        metadata={"help": "Whether to use causal atten for img anb lang tokens in vlm."},
+    )
+    pre_train: bool = field(
+        default=False,
+        metadata={"help": "Whether to apply pretraining."},
+    )
+    loss_type: str = field(
+        default='fm',
+        metadata={"help": "Which loss to use."},
+    )
+    align_params: Optional[Dict[str, Any]] = field(
+        default_factory=dict,
+        metadata={"help": "The config of vaco"},
+    )
+    my_tokenizer_max_length: int = field(
+        default=72,
+        metadata={"help": ""},
+    )
+    decayed_max_grad_norm: float = field(
+        default=1.0,
+        metadata={"help": "Maximum norm for the decayed gradients."},
+    )
+    stable_train_steps: int = field(
+        default=100000,
+        metadata={"help": "Training steps for stable training, after this step, the decayed_max_grad_norm will be applied."},
+    )
+    resume_dataloader_state: bool = field(
+        default=True,
+        metadata={"help": "Whether to resume dataloader."},
+    )
+    norm_qkv: bool = field(
+        default=False,
+        metadata={"help": "Whether to apply RMSNorm for qkv."},
+    )
+    embodiment_name: str = field(
+        default=None,
+        metadata={"help": "Name of the embodiment type."},
+    )
+
+@dataclass
+class MyDataArguments(DataArguments):
+    source_name: str = field(
+        default=None,
+        metadata={"help": "Source name of dataset."},
+    )
+    robot_config_root: str = field(
+        default=None,
+        metadata={"help": "Path to get all robot configs."},
+    )
+    joints: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "The order of joints and their dim"},
+    )
+    cameras:Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "The order of used images"},
+    )
+    norm_type:Literal["meanstd", "bounds_99", "bounds_98", "bounds_98_woclip", "bounds_99_woclip"] = field(
+        default="bounds_99",
+        metadata={"help": "Type of the normalization."},
+    )
+    img_size: int = field(
+        default=224,
+        metadata={"help": "Size of the image."},
+    )
+
+
+@dataclass
+class Arguments:
+
+    model: "ModelArguments" = field(default_factory=ModelArguments)
+    data: "MyDataArguments" = field(default_factory=MyDataArguments)
+    train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
+
+
+def main():
+    args = parse_args(Arguments)
+    logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
+    logger.info_rank0(json.dumps(asdict(args), indent=2))
+    torch.cuda.set_device(f"cuda:{args.train.local_rank}")
+    dist.init_process_group(backend="nccl")
+    helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    if args.train.local_rank == 0:
+        helper.enable_third_party_logging()
+
+    if args.train.global_rank == 0:
+        save_args(args, args.train.output_dir)
+
+    Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
+
+    init_parallel_state(
+        dp_size=args.train.data_parallel_size,
+        dp_replicate_size=args.train.data_parallel_replicate_size,
+        dp_shard_size=args.train.data_parallel_shard_size,
+        tp_size=args.train.tensor_parallel_size,
+        ep_size=args.train.expert_parallel_size,
+        pp_size=args.train.pipeline_parallel_size,
+        cp_size=args.train.context_parallel_size,
+        ulysses_size=args.train.ulysses_parallel_size,
+        dp_mode=args.train.data_parallel_mode,
+    )
+
+    logger.info_rank0("Prepare model")
+    config_kwargs = {'vlm_repo_id': getattr(args.model, "vlm_repo_id", None)}
+    config_kwargs['action_dim'] = getattr(args.train, "action_dim", 7)
+    config_kwargs['max_action_dim'] = getattr(args.train, "max_action_dim", 32)
+    config_kwargs['max_state_dim'] = getattr(args.train, "max_state_dim", 32)
+    config_kwargs['chunk_size'] = getattr(args.train, "chunk_size", 50)
+    config_kwargs['tokenizer_path'] = getattr(args.model, "tokenizer_path", None)
+    config_kwargs['post_training'] = getattr(args.model, "post_training", False)
+    config_kwargs['incremental_training'] = getattr(args.model, "incremental_training", False)
+    config_kwargs['depth_incremental_training'] = getattr(args.model, "depth_incremental_training", False)
+    config_kwargs['norm_qkv'] = getattr(args.train, "norm_qkv", False)
+    config_kwargs['enable_expert_vision'] = args.train.enable_expert_vision
+    config_kwargs['expert_vision_type'] = getattr(args.train, "expert_vision_type", None)
+    config_kwargs['expert_vision_path'] = getattr(args.train, "expert_vision_path", None)
+    config_kwargs['adanorm_time'] = getattr(args.model, "adanorm_time", False)
+    if not getattr(args.model, "adanorm_time", False):
+        assert not getattr(args.model, "separate_time_proj", False), 'separate_time_proj should be dropped when we do not apply adanorm_time!!'
+    config_kwargs['split_gate_liner'] = getattr(args.model, "split_gate_liner", False)
+    config_kwargs['nosplit_gate_liner'] = getattr(args.model, "nosplit_gate_liner", False)
+    config_kwargs['separate_time_proj'] = getattr(args.model, "separate_time_proj", False)
+    config_kwargs['old_adanorm'] = getattr(args.model, "old_adanorm", False)
+    if getattr(args.model, "old_adanorm", False):
+        assert getattr(args.model, "adanorm_time", False), 'Apply old_adanorm should apply adanorm_time!!'
+    config_kwargs['final_norm_adanorm'] = getattr(args.model, "final_norm_adanorm", False)
+    config_kwargs['loss_type'] = getattr(args.train, "loss_type", 'fm')
+    config_kwargs['align_params'] = getattr(args.train, "align_params", None)
+    if args.train.enable_expert_vision and not args.model.post_training:
+        assert args.train.expert_vision_path is not None, "expert_vision_path is required when enable_expert_vision is True!!!"
+    model = build_foundation_model(
+        config_path=args.model.config_path,
+        weights_path=args.model.model_path,
+        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+        init_device=args.train.init_device,
+        freeze_vision_encoder=args.train.freeze_vision_encoder,
+        tokenizer_max_length=args.train.tokenizer_max_length,
+        vocab_size=args.model.vocab_size,
+        use_lm_head=args.model.use_lm_head,
+        force_use_huggingface=args.model.force_use_huggingface,
+        config_kwargs=config_kwargs,
+    )
+    use_depth_align = True if args.train.align_params != {} else False
+    depth_model_type = None
+    if use_depth_align:
+        depth_model_type = args.train.align_params['depth']['model_type']
+        print('====Loading Depth Model====')
+        if depth_model_type == 'DepthAnythingV2':
+            dav2_backbone, dav2_head = build_depth_model(args.train.align_params)
+            if args.train.use_compile:
+                dav2_backbone = torch.compile(dav2_backbone)
+        elif depth_model_type == 'MoRGBD':
+            moge_model, morgbd_model = build_depth_model(args.train.align_params)
+            if args.train.use_compile:
+                moge_model = torch.compile(moge_model)
+                morgbd_model = torch.compile(morgbd_model)
+        os.makedirs(args.train.align_params['visual_dir'], exist_ok=True)
+    # num_para =sum(p.numel() for p in model.model.qwenvl_with_expert.qwen_expert.parameters())
+    # print(f'=====action expert contains {num_para} parameters.')
+    model_config = model.config
+    helper.print_device_mem_info("VRAM usage after building model")
+
+    logger.info_rank0("Prepare data")
+    processor = build_processor(args.model.tokenizer_path) # if use build_processor,  tokenizer is processor.tokenizer
+    transform = partial(
+        process_sample,
+        processor=processor,
+        source_name=args.data.source_name,
+        data_root=args.data.data_root
+    )
+    action_transform = None
+
+    if args.train.rmpad:
+        raise ValueError("Qwen2-VL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
+
+    data_collate_fn = []
+    if args.data.datasets_type == 'vla':
+        data_collate_fn.append(VLADataCollatorWithPacking())
+    else:
+        if args.train.rmpad_with_pos_ids:
+            data_collate_fn.append(OmniDataCollatorWithPacking()) # TODO 8.21
+        else:
+            data_collate_fn.append(OmniDataCollatorWithPadding())
+    # TODO enable sq
+    # if get_parallel_state().sp_enabled:
+    #     data_collate_fn.append(
+    #         OmniSequenceShardCollator(
+    #             padding_scale={
+    #                 "pixel_values": processor.image_processor.merge_size**2,
+    #             },
+    #             rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+    #         )
+    #     )
+    if args.data.dataloader_type == "native":
+        if args.data.datasets_type == "iterable":
+            logger.info_rank0("Start building iterative dataset")
+            train_dataset = build_iterative_dataset(args.data.train_path, transform=transform, seed=args.train.seed)
+            args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
+        elif args.data.datasets_type == "mapping":
+            logger.info_rank0("Start building mapping dataset")
+            train_dataset = build_mapping_dataset(args.data.train_path, transform=transform)
+            args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset))
+        elif args.data.datasets_type == 'vla':
+            args.data.chunk_size = args.train.chunk_size
+            train_dataset = build_vla_dataset(dataset_config=args.data, model_config=args.model, config=model.config, processor=processor, enable_expert_vision=args.train.enable_expert_vision, train=args.train.pre_train, use_depth_align=use_depth_align, transform=action_transform, embodiment_name=args.train.embodiment_name)
+            # if 'Qwen' in args.model.tokenizer_path:
+            #     train_dataset = build_vla_dataset(dataset_config=args.data, model_config=model.config, processor=processor)
+            # else:
+            #     train_dataset = build_vla_dataset(datasets_type=args.data.datasets_type, repo_id=args.data.train_path, config=model.config, tokenizer=processor.tokenizer)
+            args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset)) # 282,408,757 for agibot
+        
+        train_dataloader = build_dataloader(
+            dataset=train_dataset,
+            micro_batch_size=args.train.micro_batch_size,
+            global_batch_size=args.train.global_batch_size,
+            dataloader_batch_size=args.train.dataloader_batch_size,
+            seed=args.train.seed,
+            collate_fn=data_collate_fn,
+            max_seq_len=args.data.max_seq_len,
+            train_steps=args.train.train_steps,
+            rmpad=args.train.rmpad,
+            rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+            bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+            dyn_bsz_margin=args.train.dyn_bsz_margin,
+            dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
+            num_workers=args.data.num_workers,
+            drop_last=args.data.drop_last,
+            pin_memory=args.data.pin_memory,
+            prefetch_factor=args.data.prefetch_factor if args.data.num_workers > 0 else None,
+        )
+    else:
+        raise NotImplementedError(f"Unsupported dataloader type: {args.data.dataloader_type}.")
+
+    fsdp_kwargs = {}
+    if args.train.freeze_vit:
+        model.visual.requires_grad_(False)
+        if args.train.data_parallel_mode == "fsdp1":
+            fsdp_kwargs["use_orig_params"] = True
+
+    model_ema = None
+
+    model = build_parallelize_model(
+        model,
+        enable_full_shard=args.train.enable_full_shard,
+        enable_mixed_precision=args.train.enable_mixed_precision,
+        enable_fp32=args.train.enable_fp32,
+        enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
+        init_device=args.train.init_device,
+        enable_fsdp_offload=args.train.enable_fsdp_offload,
+        fsdp_kwargs=fsdp_kwargs,
+        basic_modules=model._no_split_modules if args.train.module_fsdp_enable else None,
+        enable_reentrant=args.train.enable_reentrant,
+        enable_forward_prefetch=args.train.enable_forward_prefetch,
+        fsdp_llm_blocks=False,
+        ignore_norm=False,
+        use_depth_align=use_depth_align,
+    )
+    if args.train.use_compile:
+        model = torch.compile(model)
+
+    optimizer = build_optimizer(
+        model,
+        lr=args.train.lr,
+        weight_decay=args.train.weight_decay,
+        fused=False,
+        optimizer_type=args.train.optimizer,
+        post_training=args.model.post_training,
+    )
+    lr_scheduler = build_lr_scheduler(
+        optimizer,
+        train_steps=args.train.train_steps * args.train.num_train_epochs,
+        lr=args.train.lr,
+        lr_min=args.train.lr_min,
+        lr_decay_style=args.train.lr_decay_style,
+        lr_decay_ratio=args.train.lr_decay_ratio,
+        lr_warmup_ratio=args.train.lr_warmup_ratio,
+        lr_start=args.train.lr_start,
+    )
+
+    if args.train.global_rank == 0:
+        log_dir=f"{args.train.output_dir}/runs/"
+        writer = SummaryWriter(log_dir=log_dir)
+        if args.train.use_wandb:
+            wandb.init(
+                name=args.train.wandb_name,
+                config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
+            )
+
+        if args.train.enable_profiling:
+            profiler = helper.create_profiler(
+                start_step=args.train.profile_start_step,
+                end_step=args.train.profile_end_step,
+                trace_dir=args.train.profile_trace_dir,
+                record_shapes=args.train.profile_record_shapes,
+                profile_memory=args.train.profile_profile_memory,
+                with_stack=args.train.profile_with_stack,
+            )
+            profiler.start()
+
+        model_assets = [model_config, processor]
+        save_model_assets(args.train.model_assets_dir, model_assets)
+
+    start_epoch, start_step, global_step = 0, 0, 0
+    save_checkpoint_path = None
+    environ_meter = helper.EnvironMeter(
+        config=model_config,
+        global_batch_size=args.train.global_batch_size,
+        rmpad=args.train.rmpad,
+        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        empty_cache_steps=args.train.empty_cache_steps,
+    )
+
+    load_checkpoint_path = None
+    candidates = []
+    if args.train.load_checkpoint_path or args.train.enable_resume:
+        if args.train.load_checkpoint_path:
+            load_checkpoint_path = args.train.load_checkpoint_path
+            candidates = [load_checkpoint_path]
+        elif args.train.enable_resume:
+            checkpoint_dir = f'{args.train.output_dir}/checkpoints'
+            if os.path.exists(checkpoint_dir):
+                pattern = re.compile(r"global_step_(\d+)")
+                tmp = []
+                for dirname in os.listdir(checkpoint_dir):
+                    match = pattern.fullmatch(dirname)
+                    if match:
+                        step = int(match.group(1))
+                        tmp.append((step, os.path.join(checkpoint_dir, dirname)))
+                tmp.sort(key=lambda x: x[0], reverse=True)
+                candidates = [p for _, p in tmp]
+            if candidates:
+                load_checkpoint_path = candidates[0]
+            else:
+                logger.info_rank0(f"No checkpoints in {args.train.output_dir} now!")
+    if candidates:
+        last_err = None
+        loaded = False
+        for cp in candidates:
+            state = {"model": model, "ema": model_ema, "optimizer": optimizer, "extra_state": {}}  # cannot be None
+            try:
+                Checkpointer.load(cp, state)
+                global_step = state["extra_state"]["global_step"]
+                start_epoch = global_step // args.train.train_steps
+                start_step = global_step % args.train.train_steps
+                lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
+                if start_step > 0 and args.train.resume_dataloader_state:
+                    train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
+                environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
+                torch.set_rng_state(state["extra_state"]["torch_rng_state"])
+                if start_step == 0:  # resume at the end of epoch
+                    iter(train_dataloader)  # clear resume state and prefetch data
+                dist.barrier()
+                logger.info_rank0(f"Load distributed checkpoint from {cp} successfully!")
+                loaded = True
+                break
+            except Exception as e:
+                last_err = e
+                logger.info_rank0(f"Failed to load checkpoint {cp}: {repr(e)}. Trying older one...")
+                continue
+        if not loaded:
+            logger.info_rank0("Starting training from scratch. No valid checkpoint could be loaded.")
+    else:
+        logger.info_rank0("Starting training from scratch.")
+
+    helper.empty_cache()
+    model_fwd_context, model_bwd_context = build_activation_offloading_context(
+        args.train.enable_activation_offload, args.train.enable_gradient_checkpointing, args.train.activation_gpu_limit
+    )
+    model.train()
+    logger.info(
+        f"rank{args.train.local_rank} Start training, train_steps: {args.train.train_steps}, epochs: {args.train.num_train_epochs}"
+    )
+    if model_ema is not None:
+        model_ema.eval()
+    # create the path in advance to save loss log
+    if args.train.global_rank == 0:
+        os.makedirs(args.train.save_checkpoint_path, exist_ok=True)
+    for epoch in range(start_epoch, args.train.num_train_epochs):
+        if hasattr(train_dataloader, "set_epoch"):
+            train_dataloader.set_epoch(epoch)
+
+        data_loader_tqdm = trange(
+            args.train.train_steps,
+            desc=f"Epoch {epoch + 1}/{args.train.num_train_epochs}",
+            total=args.train.train_steps,
+            initial=start_step,
+            disable=args.train.local_rank != 0,
+        )
+        data_iterator = iter(train_dataloader)
+        for _ in range(start_step, args.train.train_steps):
+            global_step += 1
+            try:
+                micro_batches: List[Dict[str, Any]] = next(data_iterator)
+            except StopIteration:
+                logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
+                break
+
+            if global_step == 1:
+                helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
+
+            total_loss = 0
+            total_vla_loss = 0
+            total_depth_loss = 0
+            total_ar_loss = 0
+            depth_targets = None
+            depth_preds = None
+            ignore_batch_num = 0
+            torch.cuda.synchronize()
+            start_time = time.time()
+            for micro_batch in micro_batches:
+                dataset_names = micro_batch.pop('rep_id', None)
+                environ_meter.add(micro_batch)
+
+                micro_batch = {
+                    k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()
+                }
+                depth_forward_time = 0
+                if use_depth_align:
+                    with torch.no_grad():
+                        # torch.cuda.synchronize()
+                        depth_start_time = time.time()
+                        if depth_model_type == 'DepthAnythingV2':
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                pil_images = micro_batch.pop('pil_images', None)
+                                depth_targets, cls_token = get_depth_target(depth_model_type, dav2_backbone, pil_images)
+                        elif depth_model_type == 'MoRGBD':
+                            with torch.autocast("cuda", dtype=torch.bfloat16):
+                                pil_images = micro_batch.pop('pil_images', None)
+                                depth_targets, cls_token = get_depth_target(depth_model_type, (moge_model, morgbd_model), pil_images)
+                        # torch.cuda.synchronize()
+                        depth_forward_time = time.time() - depth_start_time
+
+                with model_fwd_context:
+                    # torch.cuda.synchronize()
+                    loss, loss_dict = model(**micro_batch)
+                    # torch.cuda.synchronize()
+
+                    loss = loss / len(micro_batches)
+
+                with model_bwd_context:
+                    loss.backward()
+
+                total_loss += loss.item()
+                del micro_batch
+            if global_step > args.train.stable_train_steps:
+                max_grad_norm = args.train.decayed_max_grad_norm
+            else:
+                max_grad_norm = args.train.max_grad_norm
+            if args.train.data_parallel_mode == "fsdp1":
+                grad_norm = model.clip_grad_norm_(max_grad_norm).item()
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm, foreach=True)
+
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            if hasattr(grad_norm, "full_tensor"):
+                grad_norm = grad_norm.full_tensor().item()
+
+            # collect mean loss across data parallel group
+            total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
+            ema_time = 0
+            torch.cuda.synchronize()
+            delta_time = time.time() - start_time
+            lr = max(lr_scheduler.get_last_lr())
+            train_metrics = environ_meter.step(delta_time, global_step=global_step)
+            # logger.info_rank0(f'=====Check MFU: {train_metrics}=====')
+            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, vla_loss: {total_vla_loss:.2f}, depth_loss: {total_depth_loss:.2f}, ar_loss: {total_ar_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            data_loader_tqdm.update()
+            logger.info_rank0(
+                f"Step {global_step}/{args.train.train_steps}, "
+                f"Epoch {epoch+1}, "
+                f"Loss {total_loss:.4f}, "
+                f"VLA_Loss {total_vla_loss:.4f}, "
+                f"Depth_Loss {total_depth_loss:.4f}, "
+                f"AR_Loss {total_ar_loss:.4f}, "
+                f"GradNorm {grad_norm:.4f}, "
+                f"LR {lr:.2e}, "
+                f"StepTime {delta_time:.3f}s, "
+                f"EMA_time {ema_time: .3f}s, "
+                f"Depth_Forward_Time {depth_forward_time: .3f}s, "
+                f"Ignore_Batch_Num {ignore_batch_num}"
+            )
+
+
+            if args.train.global_rank == 0:
+                writer.add_scalar("training/loss", total_loss, global_step)
+                writer.add_scalar("training/vla_loss", total_vla_loss, global_step)
+                writer.add_scalar("training/depth_loss", total_depth_loss, global_step)
+                writer.add_scalar("training/ar_loss", total_ar_loss, global_step)
+                writer.add_scalar("training/grad_norm", grad_norm, global_step)
+                writer.add_scalar("training/lr", lr, global_step)
+                writer.add_scalar("training/max_norm_batch", ignore_batch_num, global_step)
+                writer.add_scalar("steptime", delta_time, global_step)
+                
+                if args.train.use_wandb:
+                    train_metrics.update(
+                        {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr, "steptime": delta_time}
+                    )
+                    if global_step % 20 == 0:
+                        wandb.log({"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr, "steptime": delta_time}, step=global_step)
+
+                if args.train.enable_profiling and global_step <= args.train.profile_end_step:
+                    profiler.step()
+                    if global_step == args.train.profile_end_step:
+                        profiler.stop()
+                        helper.upload_trace(
+                            args.train.wandb_project, args.train.wandb_name, args.train.profile_trace_dir
+                        )
+
+                loss_record = {
+                    "step": global_step,
+                    "epoch": epoch + 1,
+                    "loss": total_loss,
+                    "grad_norm": grad_norm,
+                    "lr": lr,
+                    "step_time": delta_time
+                }
+                loss_file_path = os.path.join(args.train.save_checkpoint_path, "loss.jsonl")
+                try:
+                    with open(loss_file_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(loss_record, ensure_ascii=False) + "\n")
+                except Exception as e:
+                    logger.info_rank0(f"⚠️ Failed to write loss.jsonl: {e}")
+
+                if use_depth_align:
+                    if global_step % args.train.align_params['visual_steps'] == 0:
+                        with torch.no_grad():
+                            if depth_model_type == 'DepthAnythingV2':
+                                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):                
+                                    log_depth(dav2_head, depth_preds, depth_targets, steps=global_step, config=args.train.align_params, cls_token=cls_token)
+                            elif depth_model_type == 'MoRGBD':
+                                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):                
+                                    log_depth(morgbd_model, depth_preds, depth_targets, steps=global_step, config=args.train.align_params, cls_token=cls_token)
+
+            if args.train.save_steps and global_step % args.train.save_steps == 0:
+                helper.empty_cache()
+                save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
+                
+
+                state = {
+                    "model": model,
+                    "ema": model_ema,
+                    "optimizer": optimizer,
+                    "extra_state": {
+                        "global_step": global_step,
+                        "lr_scheduler": lr_scheduler.state_dict(),
+                        "train_dataloader": train_dataloader.state_dict(),
+                        "environ_meter": environ_meter.state_dict(),
+                        "torch_rng_state": torch.get_rng_state(),
+                    },
+                }
+                Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+                dist.barrier()
+                logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+                if args.train.global_rank == 0:
+                    if args.train.save_hf_weights and save_checkpoint_path is not None:
+                        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+                        model_state_dict = ckpt_to_state_dict(
+                            save_checkpoint_path=save_checkpoint_path,
+                            output_dir=args.train.output_dir,
+                            ckpt_manager=args.train.ckpt_manager,
+                        )
+                        if args.train.enable_fp32:
+                            save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets, save_dtype=torch.float32)
+                        else:
+                            save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
+                        logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+                        if "ema" in state and state["ema"] is not None:
+                            ema_hf_weights_path = os.path.join(save_checkpoint_path, "ema_hf_ckpt")
+                            ema_model_state_dict = ckpt_to_state_dict(
+                                save_checkpoint_path=save_checkpoint_path,
+                                output_dir=args.train.output_dir,
+                                ckpt_manager=args.train.ckpt_manager,
+                                ema=True
+                            )
+                            if args.train.enable_fp32:
+                                save_model_weights(ema_hf_weights_path, ema_model_state_dict, model_assets=model_assets, save_dtype=torch.float32)
+                            else:
+                                save_model_weights(ema_hf_weights_path, ema_model_state_dict, model_assets=model_assets)
+                            logger.info_rank0(f"Huggingface EMA checkpoint saved at {ema_hf_weights_path} successfully!")
+
+        data_loader_tqdm.close()
+        start_step = 0
+        helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+        if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
+            helper.empty_cache()
+            save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
+            state = {
+                "model": model,
+                "ema": model_ema,
+                "optimizer": optimizer,
+                "extra_state": {
+                    "global_step": global_step,
+                    "lr_scheduler": lr_scheduler.state_dict(),
+                    "train_dataloader": train_dataloader.state_dict(),
+                    "environ_meter": environ_meter.state_dict(),
+                    "torch_rng_state": torch.get_rng_state(),
+                },
+            }
+            Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+            dist.barrier()
+            logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+            if args.train.global_rank == 0:
+                if args.train.save_hf_weights and save_checkpoint_path is not None:
+                    hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+                    model_state_dict = ckpt_to_state_dict(
+                        save_checkpoint_path=save_checkpoint_path,
+                        output_dir=args.train.output_dir,
+                        ckpt_manager=args.train.ckpt_manager,
+                    )
+                    if args.train.enable_fp32:
+                        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets, save_dtype=torch.float32)
+                    else:
+                        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
+                    logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+                    if "ema" in state and state["ema"] is not None:
+                        ema_hf_weights_path = os.path.join(save_checkpoint_path, "ema_hf_ckpt")
+                        ema_model_state_dict = ckpt_to_state_dict(
+                            save_checkpoint_path=save_checkpoint_path,
+                            output_dir=args.train.output_dir,
+                            ckpt_manager=args.train.ckpt_manager,
+                            ema=True
+                        )
+                        if args.train.enable_fp32:
+                            save_model_weights(ema_hf_weights_path, ema_model_state_dict, model_assets=model_assets, save_dtype=torch.float32)
+                        else:
+                            save_model_weights(ema_hf_weights_path, ema_model_state_dict, model_assets=model_assets)
+                        logger.info_rank0(f"Huggingface EMA checkpoint saved at {ema_hf_weights_path} successfully!")
+
+    torch.cuda.synchronize()
+    # release memory
+    del optimizer, lr_scheduler
+    helper.empty_cache()
+    # save model in huggingface's format
+    if args.train.global_rank == 0:
+        if args.train.save_hf_weights and save_checkpoint_path is not None:
+            hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+            model_state_dict = ckpt_to_state_dict(
+                save_checkpoint_path=save_checkpoint_path,
+                output_dir=args.train.output_dir,
+                ckpt_manager=args.train.ckpt_manager,
+            )
+            if args.train.enable_fp32:
+                save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets, save_dtype=torch.float32)
+            else:
+                save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
+            logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+            if "ema" in state and state["ema"] is not None:
+                ema_hf_weights_path = os.path.join(save_checkpoint_path, "ema_hf_ckpt")
+                ema_model_state_dict = ckpt_to_state_dict(
+                    save_checkpoint_path=save_checkpoint_path,
+                    output_dir=args.train.output_dir,
+                    ckpt_manager=args.train.ckpt_manager,
+                    ema=True
+                )
+                if args.train.enable_fp32:
+                    save_model_weights(ema_hf_weights_path, ema_model_state_dict, model_assets=model_assets, save_dtype=torch.float32)
+                else:
+                    save_model_weights(ema_hf_weights_path, ema_model_state_dict, model_assets=model_assets)
+                logger.info_rank0(f"Huggingface EMA checkpoint saved at {ema_hf_weights_path} successfully!")
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
