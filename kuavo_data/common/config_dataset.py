@@ -37,6 +37,9 @@ class Config:
     depth_range: tuple[int, int]
     dex_dof_needed: int  # 通常为1，表示只需要第一个关节作为开合依据
     platform_type: str # 机器人类型：'4pro' 或 '5w'
+    include_waist: bool
+    waist_state_index: int
+    waist_command_topic: str
     
     # Timeline settings
     train_hz: int
@@ -140,6 +143,23 @@ def load_config(cfg) -> Config:
     which_arm = OmegaConf.select(cfg, 'dataset.which_arm')
     if which_arm not in ['left', 'right', 'both']:
         raise ValueError(f"Invalid which_arm: {which_arm}, must be 'left', 'right', or 'both'")
+
+    platform_type = OmegaConf.select(cfg, 'dataset.platform_type', default=DEFAULT_PLATFORM)
+    include_waist = OmegaConf.select(cfg, 'dataset.include_waist', default=False)
+    waist_state_index = OmegaConf.select(cfg, 'dataset.waist_state_index', default=12)
+    waist_command_topic = OmegaConf.select(
+        cfg,
+        'dataset.waist_command_topic',
+        default='/robot_waist_motion_data',
+    )
+    if include_waist and (platform_type != '5' or which_arm != 'right'):
+        raise ValueError(
+            "dataset.include_waist currently requires platform_type='5' and which_arm='right'"
+        )
+    if waist_state_index < 0:
+        raise ValueError("dataset.waist_state_index must be >= 0")
+    if include_waist and not waist_command_topic:
+        raise ValueError("dataset.waist_command_topic must not be empty")
     
     # Create ResizeConfig object
     resize_config = ResizeConfig(
@@ -163,5 +183,8 @@ def load_config(cfg) -> Config:
         relative_start=OmegaConf.select(cfg, 'dataset.relative_start', default=False),
         resize=resize_config,
         task_description=OmegaConf.select(cfg, 'dataset.task_description', default="Pick and Place Task"),
-        platform_type=OmegaConf.select(cfg, 'dataset.platform_type', default=DEFAULT_PLATFORM),
+        platform_type=platform_type,
+        include_waist=include_waist,
+        waist_state_index=waist_state_index,
+        waist_command_topic=waist_command_topic,
     )

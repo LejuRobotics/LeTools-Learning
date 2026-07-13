@@ -1,0 +1,26 @@
+env:
+  inference_env: sim
+  platform_type: "5"
+  which_arm: right
+  eef_type: rq2f85
+  control_mode: joint
+  include_waist: true
+  waist_state_index: 12
+  arm_state_keys: ["joint_q", "gripper", "waist"]
+  ros_rate: 10
+  direct_to_wbc: false
+  enable_action_interpolation: true
+  control_rate: 100
+  image_size: [848, 480]
+
+inference:
+  go_bag_path: null
+  policy_type: client
+  pretrained_path: /path/to/checkpoint
+  eval_episodes: 10
+  max_episode_steps: 200
+  task_prompt: "Pick and Place"
+  async_inference: false
+  rtc_lite_enabled: false
+  rtc_full_enabled: false
+  rtc_full_mode: vjp

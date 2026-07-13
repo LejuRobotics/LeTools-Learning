@@ -42,6 +42,7 @@ class Range:
 class LimitsConfig:
     joint_q: Range = field(default_factory=lambda: Range([-3.14]*14, [3.14]*14))
     gripper: Range = field(default_factory=lambda: Range([0, 0], [1, 1]))
+    waist: Range = field(default_factory=lambda: Range([-3.14], [3.14]))
     eef: Range = field(default_factory=lambda: Range(
         [-1, -1, -1, -3.14, -3.14, -3.14,
          -1, -1, -1, -3.14, -3.14, -3.14],
@@ -70,6 +71,8 @@ class ConfigEnv:
     platform_type: str = "4pro"
     control_mode: str = "joint"
     which_arm: str = "both"
+    include_waist: bool = False
+    waist_state_index: int = 12
     head_init: Optional[List[float]] = field(default_factory=lambda: [0.0, 0.0])
     use_delta: bool = False
     delta_type: str = "Tsub"  # "Tsub","Tinv","RPY"
@@ -101,6 +104,22 @@ class ConfigEnv:
             raise ValueError(f"Invalid platform_type: {self.platform_type}. Valid: 4pro, 5w, 5")
         if self.which_arm not in ["left", "right", "both"]:
             raise ValueError(f"Invalid which_arm: {self.which_arm}. Valid: left, right, both")
+        if self.include_waist and (
+            self.inference_env != "sim"
+            or self.platform_type != "5"
+            or self.which_arm != "right"
+            or self.control_mode != "joint"
+        ):
+            raise ValueError(
+                "env.include_waist currently requires sim, platform_type='5', "
+                "which_arm='right', and control_mode='joint'"
+            )
+        if self.waist_state_index < 0:
+            raise ValueError("env.waist_state_index must be >= 0")
+        if self.include_waist and "waist" not in self.obs_key_map:
+            raise ValueError("env.include_waist requires a waist entry in env.obs_key_map")
+        if self.include_waist and "waist" not in self.arm_state_keys:
+            raise ValueError("env.include_waist requires waist in env.arm_state_keys")
         if not isinstance(self.image_size, list) or len(self.image_size) != 2:
             raise ValueError("image_size must be a list [height, width]")
         # ensure lists lengths for arm bounds
@@ -160,6 +179,12 @@ class ConfigEnv:
             # 特殊键处理
             if key == "joint_q":
                 base["handle"]["params"]["slice"] = self.joint_q_slice
+            if key == "waist":
+                if not self.include_waist:
+                    continue
+                base["handle"]["params"]["slice"] = [
+                    [self.waist_state_index, self.waist_state_index + 1]
+                ]
             if key in ["rq2f85", "qiangnao", "leju_claw"]:
                 base["handle"]["params"]["slice"] = self.gripper_slice
                 obs_map["gripper"] = base
@@ -385,12 +410,15 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
         env_cfg = cfg_dict.get("env", {})
         eef_type = env_cfg.get("eef_type")
         which_arm = env_cfg.get("which_arm", "both")
+        include_waist = bool(env_cfg.get("include_waist", False))
         obs_key_map = env_cfg.get("obs_key_map", {})
         if not isinstance(obs_key_map, dict):
             return cfg_dict
 
         filtered = {}
         for key, value in obs_key_map.items():
+            if key == "waist" and not include_waist:
+                continue
             if key == "wrist_cam_l" and which_arm == "right":
                 continue
             if key == "wrist_cam_r" and which_arm == "left":
@@ -451,6 +479,7 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
                 env_cfg["limits"] = LimitsConfig(
                     joint_q=dict_to_range(v.get("joint_q", {})),
                     gripper=dict_to_range(v.get("gripper", {})),
+                    waist=dict_to_range(v.get("waist", {})),
                     eef=dict_to_range(v.get("eef", {})),
                     eef_relative=dict_to_range(v.get("eef_relative", {})),
                     base=dict_to_range(v.get("base", {})),

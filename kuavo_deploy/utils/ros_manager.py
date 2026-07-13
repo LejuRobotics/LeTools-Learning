@@ -16,8 +16,8 @@ class ROSManager:
         self.subscribers.append(sub)
         return sub
 
-    def register_publisher(self, topic, msg_type, queue_size=10):
-        pub = rospy.Publisher(topic, msg_type, queue_size=queue_size)
+    def register_publisher(self, topic, msg_type, queue_size=10, latch=False):
+        pub = rospy.Publisher(topic, msg_type, queue_size=queue_size, latch=latch)
         self.publishers.append(pub)
         return pub
 

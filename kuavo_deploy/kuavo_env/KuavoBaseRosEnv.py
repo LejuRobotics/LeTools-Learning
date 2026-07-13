@@ -9,6 +9,10 @@ import time
 import sys
 from kuavo_humanoid_sdk import KuavoSDK, KuavoRobot, KuavoRobotState, DexterousHand
 from kuavo_humanoid_sdk.msg.kuavo_msgs.msg import lejuClawCommand
+try:
+    from kuavo_humanoid_sdk.msg.kuavo_msgs.msg import robotWaistControl
+except ImportError:
+    robotWaistControl = None
 from kuavo_humanoid_sdk.msg.kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest)
 from kuavo_deploy.utils.logging_utils import setup_logger
 from kuavo_deploy.config import KuavoConfig
@@ -20,6 +24,7 @@ from kuavo_deploy.utils.obs_buffer import ObsBuffer
 from kuavo_deploy.utils.signal_controller import ControlSignalManager
 from kuavo_deploy.utils.lowpass_filter import LowPassFilter
 from std_srvs.srv import SetBool
+from std_msgs.msg import Bool
 
 log_robot = setup_logger("robot")
 
@@ -54,6 +59,7 @@ class KuavoBaseRosEnv(gym.Env):
         self.only_arm = config_kuavo_env.only_arm
         self.eef_type = config_kuavo_env.eef_type
         self.which_arm = config_kuavo_env.which_arm
+        self.include_waist = config_kuavo_env.include_waist
         self.direct_to_wbc = config_kuavo_env.direct_to_wbc
         self.qiangnao_dof_needed = config_kuavo_env.qiangnao_dof_needed
         self.control_rate_hz = getattr(config_kuavo_env, "control_rate", 100)
@@ -111,6 +117,9 @@ class KuavoBaseRosEnv(gym.Env):
         if self.which_arm == 'right':
             obs_low.extend(joint_min[7:14]+grip_min[1:2])
             obs_high.extend(joint_max[7:14]+grip_max[1:2])
+        if self.include_waist:
+            obs_low.extend(limits['waist']['min'])
+            obs_high.extend(limits['waist']['max'])
 
         self.obs_low = np.array(obs_low)
         self.obs_high = np.array(obs_high)
@@ -192,6 +201,10 @@ class KuavoBaseRosEnv(gym.Env):
         # ===============================
         arm_low, arm_high = get_arm_action_range(self.which_arm)
 
+        if self.include_waist:
+            arm_low += limits['waist']['min']
+            arm_high += limits['waist']['max']
+
         # ===============================
         # 如果包含 base 控制，则拼接 base 范围
         # ===============================
@@ -228,6 +241,19 @@ class KuavoBaseRosEnv(gym.Env):
             self.lejuclaw = LejuClaw()
         elif self.eef_type == 'qiangnao':
             self.qiangnao = DexterousHand()
+
+        if self.include_waist:
+            if robotWaistControl is None:
+                raise ImportError(
+                    "robotWaistControl is unavailable in kuavo_humanoid_sdk; "
+                    "install a waist-enabled SDK before using include_waist"
+                )
+            self.pub_waist = self.ros_manager.register_publisher(
+                '/robot_waist_motion_data', robotWaistControl, queue_size=10
+            )
+            self.pub_waist_enable = self.ros_manager.register_publisher(
+                '/humanoid_controller/enable_waist_control', Bool, queue_size=1, latch=True
+            )
         # obs buffer 初始化            
         self.obs_buffer.wait_buffer_ready()
 
@@ -237,6 +263,8 @@ class KuavoBaseRosEnv(gym.Env):
         self._enter_external_control_mode()
         self._reset_head()
         self._reset_eef()
+        if self.include_waist:
+            self._enable_waist_control()
 
         # === 平均当前观测和位姿 ===
         avg_data = self._compute_average_state(average_num=10)
@@ -563,6 +591,8 @@ class KuavoBaseRosEnv(gym.Env):
             target_position = np.concatenate((self.arm_init[:7], right_joints), axis=0)
             self.safe_control_arm(target_position)
             self._control_eef(0, right_eef)
+            if self.include_waist:
+                self._control_waist(action[8])
         else:
             raise KeyError(f"Unsupported which_arm: {self.which_arm}")
 
@@ -597,6 +627,17 @@ class KuavoBaseRosEnv(gym.Env):
 
         else:
             raise KeyError(f"Unsupported eef_type: {self.eef_type}")
+
+    def _enable_waist_control(self, enabled=True):
+        self.pub_waist_enable.publish(Bool(data=enabled))
+
+    def _control_waist(self, waist_yaw_rad):
+        """Publish the model's radian target in the simulator's degree format."""
+        msg = robotWaistControl()
+        if hasattr(msg, "header"):
+            msg.header.stamp = rospy.Time.now()
+        msg.data.data = [float(np.rad2deg(waist_yaw_rad))]
+        self.pub_waist.publish(msg)
 
     def compute_reward(self):
         """计算奖励"""
@@ -660,6 +701,8 @@ class KuavoBaseRosEnv(gym.Env):
         """关闭环境，释放资源"""
         log_robot.info("Closing KuavoBaseRosEnv...")
         try:
+            if self.include_waist and hasattr(self, 'pub_waist_enable'):
+                self._enable_waist_control(False)
             if hasattr(self, 'obs_buffer'):
                 self.obs_buffer.stop_subscribers()
                 if hasattr(self.obs_buffer, 'obs_buffer_data'):

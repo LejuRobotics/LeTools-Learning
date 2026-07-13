@@ -37,7 +37,7 @@
 - Python 3.12
 - ROS Noetic
 - 支持 CUDA 的 NVIDIA GPU（训练需要）
-- Conda / Miniforge
+- uv
 - Docker 与 NVIDIA Container Toolkit（仿真或容器化 ROS 工作流需要）
 
 ---
@@ -51,20 +51,23 @@ git clone https://github.com/LejuRobotics/LeTools-Learning.git
 cd LeTools-Learning
 ```
 
-**2. 创建环境**
+**2. 确认 uv 已安装**
 
 ```bash
-conda create -n letools python=3.12
-conda activate letools
+uv --version
 ```
 
-**3. 一键安装依赖**
+**3. 创建 `.venv` 并一键安装依赖**
 
 ```bash
 source /opt/ros/noetic/setup.bash
 chmod +x setup_env.sh
 bash setup_env.sh
+source .venv/bin/activate
 ```
+
+`setup_env.sh` 会通过 uv 自动准备 Python 3.12，并将所有 Python 依赖安装到项目内的 `.venv`。
+ROS、ffmpeg 和 PortAudio 属于系统依赖，不由 uv 管理；脚本会检测 ffmpeg，并在缺少 PortAudio 时给出安装命令。
 
 > 📘 完整安装步骤见 [安装指南](https://www.letools.lejurobot.com/docs.html#get_started/installation.md)
 
@@ -86,6 +89,7 @@ dataset:
   platform_type: "4pro"      # 4pro, 5, or 5w
   eef_type: leju_claw        # leju_claw, rq2f85, or qiangnao
   which_arm: both            # left, right, or both
+  use_videos: false          # false saves frames as images; true encodes MP4
   task_description: "Pick and Place"
 ```
 

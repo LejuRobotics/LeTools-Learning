@@ -5,6 +5,8 @@ env:  # 推理环境设置。
   platform_type: "4pro"  # 机器人型号。
   control_mode: joint  # 控制方式。
   which_arm: both  # 控制左手、右手还是双手。
+  include_waist: false  # Scene1 仿真可开启腰部 yaw 控制。
+  waist_state_index: 12  # Kuavo 5 的29维 joint_q 中腰部 yaw 索引。
   head_init: [0, 12]  # 仿真中使用的头部初始角度 [yaw, pitch]。真机不会使用此角度。
 
   ros_rate: 10  # ROS 运行频率。
@@ -18,6 +20,7 @@ env:  # 推理环境设置。
     wrist_cam_l: ["/cam_l/color/image_raw/compressed", "CompressedImage", 30, "${env.image_size}"]  # 左腕相机 topic。
     wrist_cam_r: ["/cam_r/color/image_raw/compressed", "CompressedImage", 30, "${env.image_size}"]  # 右腕相机 topic。
     joint_q: ["/sensors_data_raw", "sensorsData", 500]  # 关节状态 topic。
+    waist: ["/sensors_data_raw", "sensorsData", 500]  # 开启 include_waist 时读取 joint_q[waist_state_index]。
     rq2f85: ["/gripper/state", "JointState", 500]  # RQ2F85 topic。选这个夹爪时自动生效。
     leju_claw: ["/leju_claw_state", "lejuClawState", 500]  # Leju claw topic。选这个夹爪时自动生效。
     qiangnao: ["/dexhand/state", "JointState", 500]  # Qiangnao topic。选这个手型时自动生效。
@@ -33,6 +36,9 @@ env:  # 推理环境设置。
     gripper:  # 夹爪上下限。
       min: [0, 0]  # 夹爪最小值。
       max: [1, 1]  # 夹爪最大值。
+    waist:  # 腰部 yaw 上下限，单位 radian。
+      min: [-3.14]
+      max: [3.14]
     eef:  # 末端绝对位姿上下限。
       min: [-1, -1, -1, -3.14, -3.14, -3.14, -1, -1, -1, -3.14, -3.14, -3.14]  # 末端绝对最小值。
       max: [1, 1, 1, 3.14, 3.14, 3.14, 1, 1, 1, 3.14, 3.14, 3.14]  # 末端绝对最大值。

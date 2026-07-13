@@ -32,7 +32,7 @@ adapters:
       mode: uv                                                # uv | conda | none
       project: ${REPO_ROOT}/kuavo_model/external_models/openpi
     args:
-      checkpoint: /path/to/openpi/checkpoint                  # 必填：openpi checkpoint 目录
+      checkpoint: /workspace/leju-kuavo-challenge-cup-2026/LeTools-Learning/scene2-3-pi0-15000/15000             # 必填：openpi checkpoint 目录
       policy_config_name: pi0_kuavo                           # openpi 训练 config 名
       which_arm: both                                         # left | right | both（adapter 默认 right）
       model_repo_root: ""                                     # 留空 -> external_models/openpi

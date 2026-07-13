@@ -66,6 +66,7 @@ def init_parameters(cfg):
     global TASK_DESCRIPTION
     global DEX_DOF_NEEDED
     global PLATFORM_TYPE
+    global INCLUDE_WAIST, WAIST_STATE_INDEX, WAIST_COMMAND_TOPIC
 
     
     from .config_dataset import load_config
@@ -81,6 +82,9 @@ def init_parameters(cfg):
     SAMPLE_DROP = config.sample_drop
     CONTROL_HAND_SIDE = config.which_arm
     PLATFORM_TYPE = config.platform_type
+    INCLUDE_WAIST = config.include_waist
+    WAIST_STATE_INDEX = config.waist_state_index
+    WAIST_COMMAND_TOPIC = config.waist_command_topic
 
     # 根据which_arm自动计算的切片配置
     SLICE_ROBOT = config.slice_robot
@@ -212,6 +216,15 @@ class KuavoMsgProcesser:
         
         # radian
         return {"data": np.deg2rad(msg.position), "timestamp": msg.header.stamp.to_sec()}
+
+    @staticmethod
+    def process_waist_command(msg):
+        """Convert the commanded waist yaw from degrees to radians."""
+        data = getattr(getattr(msg, "data", None), "data", None)
+        if data is None or len(data) == 0:
+            raise ValueError("waist command message data.data is empty")
+        waist_yaw = np.asarray([np.deg2rad(float(data[0]))], dtype=np.float32)
+        return {"data": waist_yaw, "timestamp": msg.header.stamp.to_sec()}
     
     @staticmethod
     def process_claw_state(msg):
@@ -351,6 +364,11 @@ class KuavoRosbagReader:
                 "msg_process_fn": self._msg_processer.process_rq2f85_cmd,
             },
         }
+        if INCLUDE_WAIST:
+            self._topic_process_map["action.waist_yaw"] = {
+                "topic": WAIST_COMMAND_TOPIC,
+                "msg_process_fn": self._msg_processer.process_waist_command,
+            }
         for camera in DEFAULT_CAMERA_NAMES:
             # observation.images.{camera}.depth  => color images
             # if 'wrist' in camera or 'head_cam_h' in camera:

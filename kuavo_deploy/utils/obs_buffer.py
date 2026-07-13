@@ -155,6 +155,12 @@ class ObsBuffer:
         self.compute_dependent_obs(key, arm_joints, timestamp)
 
         slice_value = handle.get("params", {}).get("slice", None)  
+        if key == "waist":
+            if not slice_value or len(joint) <= slice_value[0][0]:
+                raise ValueError(
+                    f"Waist observation requires joint_q index "
+                    f"{slice_value[0][0] if slice_value else 'unset'}, got {len(joint)} values"
+                )
         joint = [x for slc in slice_value for x in joint[slc[0]:slc[1]]]
         # joint = torch.tensor(joint, dtype=torch.float32, device=self.device)
         self._append_data(key, joint, timestamp)
@@ -286,4 +292,3 @@ class ObsBuffer:
                 aligned_obs[k] = data[idx]
 
         return aligned_obs
-

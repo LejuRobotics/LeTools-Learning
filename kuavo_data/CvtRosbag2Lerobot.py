@@ -61,6 +61,15 @@ log_print = logging.getLogger(__name__)
 
 
 def setup_logging():
+    # ROS Noetic's RospyLogger.findCaller can loop forever on Python 3.12
+    # when the frame returned by the standard logger is no longer on the stack.
+    try:
+        import rosgraph.roslogging
+
+        rosgraph.roslogging.RospyLogger.findCaller = logging.Logger.findCaller
+    except (ImportError, AttributeError):
+        pass
+
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(logging.INFO)
@@ -418,6 +427,38 @@ def populate_dataset_chunked(
                 else:
                     raise ValueError(f"eef type are not supported! ")
 
+                if kuavo.INCLUDE_WAIST:
+                    if state.size != 29:
+                        raise ValueError(
+                            f"Waist-enabled conversion requires 29D joint state, got {state.size}D "
+                            f"in episode {ep_idx}, frame {frame_idx}"
+                        )
+                    if kuavo.WAIST_STATE_INDEX >= state.size:
+                        raise ValueError(
+                            f"waist_state_index={kuavo.WAIST_STATE_INDEX} is outside "
+                            f"the {state.size}D joint state"
+                        )
+                    waist_action = get_array("action.waist_yaw", np.float32)
+                    if waist_action.size != 1:
+                        log_print.warning(
+                            f"Episode {ep_idx} Frame {frame_idx}: Missing or invalid waist action data"
+                        )
+                        return
+
+                    final_state = np.concatenate(
+                        (final_state, state[kuavo.WAIST_STATE_INDEX:kuavo.WAIST_STATE_INDEX + 1])
+                    ).astype(np.float32)
+                    final_action = np.concatenate(
+                        (final_action, waist_action)
+                    ).astype(np.float32)
+
+                expected_dim = len(DEFAULT_JOINT_NAMES_LIST)
+                if final_state.size != expected_dim or final_action.size != expected_dim:
+                    raise ValueError(
+                        f"Dataset schema expects {expected_dim} values, got "
+                        f"state={final_state.size}, action={final_action.size}"
+                    )
+
                 # =========================
                 # 6. 构建 frame
                 # =========================
@@ -673,6 +714,9 @@ def main(cfg: DictConfig):
     merge_sources = [Path(p).expanduser().resolve() for p in merge_source_cfg] if merge_source_cfg else []
 
     chunk_size = cfg.rosbag.get("chunk_size", 100)
+    use_videos = bool(cfg.dataset.get("use_videos", True))
+    dataset_config = dataclasses.replace(DEFAULT_DATASET_CONFIG, use_videos=use_videos)
+    media_mode: Literal["video", "image"] = "video" if use_videos else "image"
     
     log_print.info(f"=== Chunked Streaming Rosbag Converter ===")
     log_print.info(f"Mode: {mode}")
@@ -685,6 +729,7 @@ def main(cfg: DictConfig):
     log_print.info(f"Target dir: {target_dir}")
     log_print.info(f"LeRobot output dir: {output_dir}")
     log_print.info(f"Chunk size: {chunk_size}")
+    log_print.info(f"Image storage: {'MP4 video' if use_videos else 'individual images'}")
 
     half_arm = len(kuavo.DEFAULT_ARM_JOINT_NAMES) // 2
     half_claw = len(kuavo.DEFAULT_LEJUCLAW_JOINT_NAMES) // 2
@@ -705,6 +750,8 @@ def main(cfg: DictConfig):
             (kuavo.SLICE_ROBOT[1][0] - arm_base_start + half_dexhand, kuavo.SLICE_ROBOT[1][-1] - arm_base_start + half_dexhand), (kuavo.SLICE_DEX[1][0] + half_arm * 2, kuavo.SLICE_DEX[1][-1] + half_arm * 2)
             ]
     DEFAULT_JOINT_NAMES_LIST = [DEFAULT_ARM_JOINT_NAMES[k] for l, r in arm_slice for k in range(l, r)]
+    if kuavo.INCLUDE_WAIST:
+        DEFAULT_JOINT_NAMES_LIST.append("waist_yaw")
 
     if mode == "normal":
         if raw_dir is None:
@@ -718,7 +765,8 @@ def main(cfg: DictConfig):
             raw_dir=raw_dir,
             repo_id=repo_id,
             task=kuavo.TASK_DESCRIPTION,
-            mode="video",
+            mode=media_mode,
+            dataset_config=dataset_config,
             root=str(output_dir),
             n=n,
             chunk_size=chunk_size,
@@ -739,6 +787,7 @@ def main(cfg: DictConfig):
             repo_id=repo_id,
             resume_root=resume_target,
             task=kuavo.TASK_DESCRIPTION,
+            dataset_config=dataset_config,
             n=n,
             chunk_size=chunk_size,
             platform_type=kuavo.PLATFORM_TYPE,
