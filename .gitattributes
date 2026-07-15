@@ -1,2 +1,0 @@
-kuavo_model/external_models/gr00tn1d7/scripts/deployment/dgpu/wheels/*.whl filter=lfs diff=lfs merge=lfs -text
-kuavo_model/external_models/gr00tn1d7/scripts/deployment/dgpu/wheels/flash_attn-2.7.4.post1-cp310-cp310-linux_x86_64.whl filter=lfs diff=lfs merge=lfs -text
