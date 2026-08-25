@@ -299,8 +299,12 @@ def main():
         def start_task(cmd):
             global current_proc
             log_path = LOG_DIR / "kuavo_deploy.log"
+            env = os.environ.copy()
+            # 将项目根目录加入 PYTHONPATH，确保子进程能找到 kuavo_deploy 模块
+            project_root = str(Path(__file__).resolve().parent.parent)
+            env['PYTHONPATH'] = project_root + os.pathsep + env.get('PYTHONPATH', '')
             with open(log_path, "w") as f:
-                current_proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+                current_proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
             print(f"任务已启动，PID: {current_proc.pid}")
             interactive_controller()
 

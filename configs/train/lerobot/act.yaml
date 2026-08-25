@@ -1,20 +1,20 @@
 # LeRobot ACT 简化配置。
 dataset: 
-  repo_id: "lerobot/your_dataset"  # 数据集名字，用来做标识。
-  root: null  # 数据地址
+  repo_id: "lerobot/grasp_ring"  # 数据集名字，用来做标识。
+  root: /home/zwl/merge8.4/letools_opensource/LeTools-Learning/kuavo_data/6/lerobot
 
 training: 
   resume: false  # 是否从 output_dir 最新 checkpoint 继续训；续训改为 true，并修改 output_dir 为上阶段 run 的产物路径，如 outputs/train/act_YYYYMMDD_HHMMSS。
-  output_dir: "outputs/train/act" # 权重存储路径
-  job_name: "act"  # 实验名。
-  batch_size: 32  
-  steps: 100000  # 总训练步数
-  save_freq: 20000  # 每N步保存一次权重
+  output_dir: "outputs/train/act_7/lerobot_grasp_ring" # 权重存储路径
+  job_name: "act_3/lerobot_grasp_ring"  # 实验名。
+  batch_size: 8 
+  steps: 30000 # 总训练步数
+  save_freq: 10000 # 每N步保存一次权重
   num_workers: 8  
   seed: 1000  
 
 wandb:  # wandb的一些设置
-  enable: true  # 是否启用 wandb。
+  enable: false  # 是否启用 wandb。
   project: "lerobot_act"  # wandb 项目名。
 
 policy: 

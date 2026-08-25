@@ -2,7 +2,7 @@
 # 定义不同硬件平台（4Pro、5W）的关节索引范围
 
 # 默认硬件类型
-default: "4pro"
+default: "5w"
 
 # 硬件平台定义
 platforms:
