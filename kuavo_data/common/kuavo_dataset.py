@@ -214,6 +214,25 @@ class KuavoMsgProcesser:
         return {"data": np.deg2rad(msg.position), "timestamp": msg.header.stamp.to_sec()}
     
     @staticmethod
+    def process_two_arm_hand_pose_cmd(msg):
+        """Process /mm/two_arm_hand_pose_cmd message as arm trajectory.
+
+        当 frame=5（关节空间）时，从 left_pose.joint_angles 和 right_pose.joint_angles
+        提取14维手臂关节角（弧度），作为 action.kuavo_arm_traj 的替代数据源。
+
+        Args:
+            msg (kuavo_msgs/twoArmHandPoseCmd): 双臂手部位姿指令
+
+        Returns:
+            Dict: 14维手臂关节角（弧度）+ 时间戳
+        """
+        left_ja = np.array(msg.hand_poses.left_pose.joint_angles, dtype=np.float64)
+        right_ja = np.array(msg.hand_poses.right_pose.joint_angles, dtype=np.float64)
+        arm_traj = np.concatenate([left_ja, right_ja])
+        ts = msg.hand_poses.header.stamp.to_sec()
+        return {"data": arm_traj, "timestamp": ts}
+    
+    @staticmethod
     def process_claw_state(msg):
         """
             Args:
@@ -313,8 +332,8 @@ class KuavoRosbagReader:
                 "msg_process_fn": self._msg_processer.process_joint_state,
             },
             "action.kuavo_arm_traj": {
-                "topic": "/kuavo_arm_traj",
-                "msg_process_fn": self._msg_processer.process_kuavo_arm_traj,
+                "topic": "/joint_cmd",
+                "msg_process_fn": self._msg_processer.process_joint_cmd_extract_arm,
             },
             "action": {
                 "topic": "/joint_cmd",

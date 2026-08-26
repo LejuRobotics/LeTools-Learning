@@ -213,8 +213,17 @@ def _load_bag_frames(
         rq2f85_state = _normalize_binary_or_range(rq2f85_state, binary_threshold=0.4, scale=0.8)
         rq2f85_action = _normalize_binary_or_range(rq2f85_action, binary_threshold=70, scale=255)
 
-        if claw_state.size == 0 and qiangnao_state.size == 0:
-            claw_state = rq2f85_state
+        # Prefer /gripper/state (rq2f85) over /leju_claw_state (claw) for state observation
+        # /leju_claw_state has dual-publisher conflict in simulation (percentage vs radians)
+        if rq2f85_state.size > 0:
+            if kuavo.IS_BINARY:
+                claw_state = rq2f85_state  # binary: already 0 or 1
+            else:
+                # Convert rq2f85_state (normalized by /0.8) to claw scale (normalized by /100)
+                # rq2f85_norm = (ctrl+100)/200, claw_norm = 1-ctrl/255
+                # => claw_norm = (355 - 200 * rq2f85_norm) / 255
+                claw_state = ((355.0 - 200.0 * rq2f85_state) / 255.0).astype(np.float32)
+        if claw_action.size == 0 and rq2f85_action.size > 0:
             claw_action = rq2f85_action
 
         state_parts: list[np.ndarray] = []

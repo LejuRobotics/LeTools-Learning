@@ -11,7 +11,11 @@ import sys
 from kuavo_deploy.config import KuavoConfig
 from sensor_msgs.msg import CompressedImage, JointState
 from torchvision.transforms.functional import to_tensor
-from kuavo_humanoid_sdk.msg.kuavo_msgs.msg import sensorsData,lejuClawState
+# 优先从 ROS 工作空间导入消息类（确保 MD5 与发布端一致），失败时回退到 SDK 内置定义
+try:
+    from kuavo_msgs.msg import sensorsData, lejuClawState
+except ImportError:
+    from kuavo_humanoid_sdk.msg.kuavo_msgs.msg import sensorsData, lejuClawState
 from kuavo_deploy.utils.signal_controller import ControlSignalManager
 from kuavo_deploy.utils.logging_utils import setup_logger
 from kuavo_deploy.utils.ros_manager import ROSManager
@@ -177,10 +181,12 @@ class ObsBuffer:
 
     def rq2f85State_callback(self, msg: JointState, key: str, handle = dict):
         joint = msg.position
-        joint = [figure / 0.8 for figure in joint]
+        # Convert /gripper/state to [0,1] matching /leju_claw_state/100 scale
+        # gripper_state = (ctrl+100)*0.8/200, percentage = 100-ctrl/2.55
+        # => normalized = (355 - 250 * gripper_state) / 255
+        joint = [(355.0 - 250.0 * figure) / 255.0 for figure in joint]
         slice_value = handle.get("params", {}).get("slice", None)
         joint = [x for slc in slice_value for x in joint[slc[0]:slc[1]]]
-        # joint = torch.tensor(joint, dtype=torch.float32, device=self.device)
         self._append_data(key, joint, msg.header.stamp.to_sec())
 
     # ===== 公共方法 =====
