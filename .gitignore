@@ -218,6 +218,8 @@ ana.py
 error.txt
 obs.png
 flash*
+!kuavo_model/external_models/lingbot-vla-v2/lingbotvla/models/vla/vision_models/dino_video/lumos_dinov3/layers/flash_attention.py
+!kuavo_model/external_models/lingbot-vla-v2/lingbotvla/models/vla/vision_models/dino_video/lumos_dinov3/layers/flash_attention_packed.py
 
 .codex
 kuavo_server/skills
