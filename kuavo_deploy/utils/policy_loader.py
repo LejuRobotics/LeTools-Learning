@@ -150,6 +150,75 @@ def _resolve_model_weights_file(base_model_name_or_path: str) -> Path:
     return Path(resolved_file).resolve()
 
 
+def _restore_pi_nonpersistent_buffers(policy: torch.nn.Module) -> None:
+    """Rebuild the positional buffers which ``to_empty`` discards.
+
+    ``_construct_empty_pi`` runs the LeRobot constructors on the meta device and
+    then materializes them with ``to_empty``, which allocates storage without
+    writing values. Buffers registered with ``persistent=False`` are not part of
+    ``state_dict``, so ``_load_pi_streaming`` -- which copies checkpoint keys and
+    nothing else -- can never assign them.
+
+    The failure is silent: the model loads, the forward pass runs, the output is
+    finite, and no checkpoint key is reported missing. Only the positional
+    encodings are wrong, so the policy still moves but its actions no longer
+    track the task coherently.
+
+    Only small deterministic buffers are rebuilt here; learned parameters are
+    never reinitialized. Unknown buffer types fail closed, so a dependency
+    update cannot silently leave uninitialized inference state behind.
+    """
+    from transformers.models.gemma.modeling_gemma import GemmaRotaryEmbedding
+    from transformers.models.siglip.modeling_siglip import SiglipVisionEmbeddings
+
+    restored = []
+    for name, module in policy.named_modules():
+        buffers = {
+            key: module._buffers[key]
+            for key in module._non_persistent_buffers_set
+            if module._buffers.get(key) is not None
+        }
+        if not buffers:
+            continue
+        if isinstance(module, GemmaRotaryEmbedding):
+            # A fresh rotary embedding recomputes inv_freq and original_inv_freq
+            # from the config, so build one and copy every buffer it declares
+            # non-persistent. The constructor is called positionally and moved
+            # afterwards so this keeps working on transformers versions that
+            # dropped the ``device`` keyword.
+            reference = GemmaRotaryEmbedding(module.config).to(module.inv_freq.device)
+            replacements = {
+                key: value
+                for key, value in reference._buffers.items()
+                if key in reference._non_persistent_buffers_set and value is not None
+            }
+            module.attention_scaling = reference.attention_scaling
+            module.max_seq_len_cached = reference.max_seq_len_cached
+            module.original_max_seq_len = reference.original_max_seq_len
+        elif isinstance(module, SiglipVisionEmbeddings):
+            replacements = {
+                "position_ids": torch.arange(
+                    module.num_positions,
+                    device=module.position_ids.device,
+                    dtype=torch.long,
+                ).expand((1, -1))
+            }
+        else:
+            raise RuntimeError(
+                f"Cannot restore nonpersistent buffers in {name} "
+                f"({type(module).__name__}): {sorted(buffers)}"
+            )
+        if buffers.keys() != replacements.keys():
+            raise RuntimeError(f"Nonpersistent buffer schema changed in {name}")
+        for key, value in replacements.items():
+            previous = buffers[key]
+            if value.is_meta or value.shape != previous.shape or value.device != previous.device:
+                raise RuntimeError(f"Invalid reconstructed buffer: {name}.{key}")
+            module._buffers[key] = value
+            restored.append(f"{name}.{key}")
+    _progress(f"[策略加载] 已重建 {len(restored)} 个非持久位置编码缓冲区: {restored}")
+
+
 def _construct_empty_pi(policy_cls: type, policy_cfg: PreTrainedConfig) -> Any:
     """Construct PI0/PI05 on the meta device, then allocate final tensors.
 
@@ -170,6 +239,7 @@ def _construct_empty_pi(policy_cls: type, policy_cfg: PreTrainedConfig) -> Any:
     # the policy. to_empty preserves the dtype selected by LeRobot's constructor.
     policy.config.device = target_device
     policy.to_empty(device=torch.device(target_device))
+    _restore_pi_nonpersistent_buffers(policy)
     return policy
 
 
