@@ -39,6 +39,7 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class ModelArguments:
+    rtc_training_max_delay: int = field(default=0, metadata={"help": "Maximum simulated RTC clean-prefix delay; 0 disables RTC training."})
     config_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the model config. Defaults to `model_path`."},

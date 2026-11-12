@@ -39,6 +39,9 @@ class ModelServerAdapter(ABC):
         """
         return [self.select_action(obs)]
 
+    def select_action_chunk_rtc(self, payload: dict[str, Any]) -> Any:
+        raise NotImplementedError(f"RTC is not supported by adapter {self.name}")
+
 
 def kuavo_repo_root() -> Path:
     return Path(__file__).resolve().parents[2]

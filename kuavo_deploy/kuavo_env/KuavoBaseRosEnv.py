@@ -6,11 +6,12 @@ from sensor_msgs.msg import CompressedImage, JointState
 from geometry_msgs.msg import Twist
 import cv2
 import gymnasium as gym
+import threading
 import time
 import sys
 from kuavo_humanoid_sdk import KuavoSDK, KuavoRobot, KuavoRobotState, DexterousHand
 from kuavo_humanoid_sdk.msg.kuavo_msgs.msg import lejuClawCommand
-from kuavo_humanoid_sdk.msg.kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest)
+from kuavo_humanoid_sdk.msg.kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest, changeLbQuickModeSrv, changeLbQuickModeSrvRequest)
 from kuavo_deploy.utils.logging_utils import setup_logger
 from kuavo_deploy.config import KuavoConfig
 from kuavo_deploy.utils.ros_manager import ROSManager
@@ -18,8 +19,10 @@ import traceback
 import torch
 from torchvision.transforms.functional import to_tensor
 from kuavo_deploy.utils.obs_buffer import ObsBuffer
+from kuavo_deploy.utils.dagger_layout import DaggerLayout
 from kuavo_deploy.utils.signal_controller import ControlSignalManager
-from kuavo_deploy.utils.lowpass_filter import LowPassFilter
+from kuavo_deploy.utils.arm_velocity_transport import SDKArmVelocityTransport, validate_arm_vector
+from kuavo_deploy.utils.interp_thread import ControlLoop
 from kuavo_deploy.utils.sg100_msgs import SG100HandCommand
 from std_srvs.srv import SetBool
 
@@ -30,7 +33,28 @@ BASE_VELOCITY_DOF = 3
 class KuavoBaseRosEnv(gym.Env):
     """Kuavo机器人ROS环境基类"""
 
+    WHEEL_QUICK_MODE_DISABLED = 0
+    WHEEL_QUICK_MODE_ARM = 2
+    WHEEL_ARM_TRANSPORT_NONE = 0
+    WHEEL_ARM_TRANSPORT_ROS = 2
+
     def __init__(self, config: KuavoConfig):
+        self.dagger_on = config.inference.dagger_on
+        self.dagger_session = None
+        self._arm_velocity_transport = None
+        self._wheel_arm_control_configured = False
+        self._wheel_arm_cleanup_required = False
+        self.single_arm_dagger = self.dagger_on and config.env.which_arm != "both"
+        self._held_arm = None
+        self._held_eef = None
+        if self.dagger_on:
+            from kuavo_deploy.utils.dagger_action_arbiter import validate_dagger_vr_mode
+            validate_dagger_vr_mode(config)
+        # 保护 _last_lower_cmd / _last_base_cmd：threaded 模式下由下发线程写入，
+        # reset() 在推理线程读取。
+        self._last_cmd_lock = threading.Lock()
+        self._last_lower_cmd = None
+        self._last_base_cmd = None
         self._init_lower_body_lock(config)
         self._set_config(config.env)
         
@@ -42,8 +66,15 @@ class KuavoBaseRosEnv(gym.Env):
         self.bridge = CvBridge()
         self._set_observation_space()
         self._set_action_space()
+        if self.dagger_on:
+            self.action_layout = DaggerLayout(self)
         self._init_kuavo_sdk()
         self._set_ros_topics()
+        try:
+            self.prepare_inactive_hold()
+        except Exception:
+            self.close()
+            raise
         
         # 等待ROS话题初始化
         log_robot.info(f"Inializing done!")
@@ -96,6 +127,8 @@ class KuavoBaseRosEnv(gym.Env):
         self.sg100_open_pose = np.asarray(config_kuavo_env.sg100_open_pose, dtype=np.float64)
         self.sg100_close_pose = np.asarray(config_kuavo_env.sg100_close_pose, dtype=np.float64)
         self.sg100_init_pose = np.asarray(config_kuavo_env.sg100_init_pose, dtype=np.float64)
+        self.sg100_joint_min = np.asarray(config_kuavo_env.sg100_joint_min, dtype=np.float64)
+        self.sg100_joint_max = np.asarray(config_kuavo_env.sg100_joint_max, dtype=np.float64)
         self.sg100_force_threshold = config_kuavo_env.sg100_force_threshold
         self.sg100_force_kp = np.asarray(config_kuavo_env.sg100_force_kp, dtype=np.float64)
         self.sg100_force_kd = np.asarray(config_kuavo_env.sg100_force_kd, dtype=np.float64)
@@ -123,18 +156,29 @@ class KuavoBaseRosEnv(gym.Env):
         self.obs_buffer = ObsBuffer(
             config=config_kuavo_env, 
             obs_key_map=self.obs_key_map,
+            cache_full_arm=self.single_arm_dagger,
         )
         self.arm_state_keys = config_kuavo_env.arm_state_keys # observation.state 的key顺序
         self.ratio = config_kuavo_env.ratio
         self.frame_alignment = config_kuavo_env.frame_alignment
+        self.execution_mode = getattr(config_kuavo_env, "execution_mode", "inline")
+        # threaded 模式：由独立线程按 control_rate_hz 独占下发，step() 只投递最新目标。
+        self.interp_threaded = (
+            self.execution_mode == "threaded"
+            and self.direct_to_wbc
+            and self.enable_action_interpolation
+        )
+        self.control_loop = None
         if self.direct_to_wbc:
             self.last_predicted_action = None
+            self.last_sent_action = None
+            self.last_sent_arm_velocity = None
             self.is_first_step = True
-            self.low_pass_filter = LowPassFilter(cutoff_hz=1.0, dt=1.0 / self.control_rate_hz)
             log_robot.info(
                 f"Direct-to-WBC action interpolation: enabled={self.enable_action_interpolation}, "
                 f"inference_rate={self.ros_rate}Hz, control_rate={self.control_rate_hz}Hz, "
-                f"interpolation_steps={self.interpolation_steps}"
+                f"interpolation_steps={self.interpolation_steps}, "
+                f"execution_mode={self.execution_mode}, threaded={self.interp_threaded}"
             )
 
     @property
@@ -267,6 +311,47 @@ class KuavoBaseRosEnv(gym.Env):
             sys.exit(1)
         self.robot = KuavoRobot()
         self.robot_state = KuavoRobotState()
+        self._cache_arm_joint_limits()
+        if self.dagger_on:
+            self._arm_velocity_transport = SDKArmVelocityTransport(self.robot)
+
+    def _cache_arm_joint_limits(self):
+        """把手臂关节限位缓存起来，避免每次下发都重新拉取并解析 URDF。
+
+        SDK 的 ``control_arm_joint_positions()`` 每次下发都会调用
+        ``KuavoRobotInfo.get_arm_joint_limits()``，而该方法无缓存，每次都重做
+        ``rospy.has_param`` + ``rospy.get_param`` 两次**同步 XML-RPC** 到 ROS
+        master（后者不填 rospy 缓存），外加一次 ``ET.fromstring(URDF)`` 与每个
+        关节一次全树 find。实测拆分（N=100，交错测量）：
+
+            whole get_arm_joint_limits           = 16.53 ms
+              humanoid_description (2x RPC)      = 14.54 ms   <- 88%
+              ET.fromstring + 14x find           =  2.54 ms   <- 15%
+
+        主项是 RPC，且它随 master/CPU 负载剧烈波动（0.2ms ~ 14.5ms 都见过），
+        这正是控制线程 dt_std 抖动（7~11ms）以及 inline 时快时慢的来源：
+        control_rate=100Hz 下每次下发有 10ms 预算，RPC 一旦超过它，
+        ``control_rate.sleep()`` 就吸收不掉，inline 的 3 次插值会串行变慢。
+        URDF 运行期不变，故启动时解析一次即可；同时把这个方差一起消掉。
+
+        解析失败/回退到 ±π 时不缓存，保持原行为以便后续可以重试。
+        """
+        try:
+            info = self.robot._robot_info
+            arm_min, arm_max = info.get_arm_joint_limits()
+            if len(arm_min) != info.arm_joint_dof:
+                log_robot.warning("[SDK] joint limits incomplete, keep stock path")
+                return
+            if np.allclose(arm_min, -np.pi) and np.allclose(arm_max, np.pi):
+                # 这是 SDK 的默认回退值，说明没读到 URDF，不能固化。
+                log_robot.warning("[SDK] joint limits fell back to ±pi, not caching")
+                return
+            info.get_arm_joint_limits = lambda: (list(arm_min), list(arm_max))
+            log_robot.info(
+                f"[SDK] arm joint limits cached at startup ({info.arm_joint_dof} joints)"
+            )
+        except Exception as e:
+            log_robot.warning(f"[SDK] joint limit cache skipped: {e}")
 
     def _set_ros_topics(self):
         """设置ROS话题"""
@@ -285,12 +370,36 @@ class KuavoBaseRosEnv(gym.Env):
             self.cmd_vel_pub = self.ros_manager.register_publisher(
                 '/cmd_vel', Twist, queue_size=10
             )
-        # obs buffer 初始化            
+        # obs buffer 初始化
         self.obs_buffer.wait_buffer_ready()
 
 
+    def prepare_inactive_hold(self):
+        if not self.single_arm_dagger or self._held_arm is not None:
+            return
+        if self.eef_type not in ("qiangnao", "leju_claw"):
+            raise ValueError("Single-arm DAgger supports qiangnao or leju_claw complete hand control")
+        device = self.qiangnao if self.eef_type == "qiangnao" else self.lejuclaw
+        if not callable(getattr(device, "control", None)):
+            raise RuntimeError("SDK has no complete end-effector control; refusing motion")
+        full = self.obs_buffer.full_arm_feedback(0.5)
+        eef = self.obs_buffer.full_eef_feedback(0.5)
+        inactive = slice(7, 14) if self.which_arm == "left" else slice(0, 7)
+        low, high = (np.asarray(self.limits["joint_q"][bound]) for bound in ("min", "max"))
+        if (full.shape != (14,) or not np.isfinite(full).all()
+                or np.any(full[inactive] < low[inactive]) or np.any(full[inactive] > high[inactive])):
+            raise ValueError("Inactive arm requires valid in-limit startup feedback")
+        size = 12 if self.eef_type == "qiangnao" else 2
+        if eef.shape != (size,) or not np.isfinite(eef).all() or np.any((eef < 0) | (eef > 100)):
+            raise ValueError("Inactive hand requires complete startup feedback in 0..100")
+        self._held_arm, self._held_eef = full.copy(), eef.copy()
+        self.arm_init = full.copy()
+        # Stop collecting complete arm/hand feedback after the startup snapshot.
+        self.obs_buffer._cache_full_arm = False
+
     def reset(self, **kwargs):
         """重置机器人状态"""
+        self.prepare_inactive_hold()
         self.stop_base()
         self._enter_external_control_mode()
         self._reset_head()
@@ -309,9 +418,61 @@ class KuavoBaseRosEnv(gym.Env):
 
         if self.direct_to_wbc:
             self.last_predicted_action = None
-            self.low_pass_filter.reset()
+            self.last_sent_action = None
+            self.last_sent_arm_velocity = None
             self.is_first_step = True
+
+        if self.interp_threaded:
+            self._start_control_loop()
         return obs, {}
+
+    def _start_control_loop(self):
+        """启动固定频率的下发线程，以当前实测状态为初值。"""
+        if self.control_loop is not None and self.control_loop.running:
+            self.control_loop.stop()
+        self.control_loop = ControlLoop(
+            self,
+            control_hz=self.control_rate_hz,
+            segment_dt=1.0 / self.ros_rate,
+            log_every_n_ticks=500,  # 每 5s 打一次 dt 统计，便于判断线程是否被抢
+        )
+        # 优先复用最后一条实际下发值（threaded 模式下由下发线程写入），
+        # 没有缓存时才退回实测状态，避免启动/重启瞬间出现位置跳变。
+        with self._last_cmd_lock:
+            cached_lower = None if self._last_lower_cmd is None else self._last_lower_cmd.copy()
+            cached_base = None if self._last_base_cmd is None else self._last_base_cmd.copy()
+        lower0 = None
+        if self.use_5w_wholebody:
+            lower0 = cached_lower
+            if lower0 is None:
+                lower0 = np.asarray(self.arm_state.get("lower_body", []), dtype=float)
+                if lower0.shape != (len(self.limits["lower_body"]["min"]),):
+                    lower0 = None
+        base0 = cached_base if self.use_5w_base_move else None
+        if base0 is None and self.use_5w_base_move:
+            base0 = np.zeros(BASE_VELOCITY_DOF, dtype=float)
+        # 末端以当前开合观测为初值，避免第一帧直接跳到模型目标。
+        eef0 = self.arm_state.get("gripper")
+        if eef0 is not None:
+            eef0 = np.asarray(eef0, dtype=float)
+            if eef0.shape != (2 * self.eef_dof_per_side,):
+                eef0 = None
+        self.control_loop.start(
+            q0=self.cur_joint_angles_action,
+            lower0=lower0,
+            base0=base0,
+            eef0=eef0,
+        )
+
+    def set_action_target(self, action):
+        """threaded 模式下由 step() 调用：非阻塞地把最新目标交给下发线程。"""
+        if self.control_loop is None or not self.control_loop.running:
+            return
+        session = self.dagger_session
+        if session is not None and session.active:
+            self.control_loop.set_target(action, generation=session.target_token())
+        else:
+            self.control_loop.set_target(action)
 
     # ==========================================================
     # 子函数 1. 外部控制模式设置
@@ -339,11 +500,13 @@ class KuavoBaseRosEnv(gym.Env):
             rospy.wait_for_service('/enable_lb_arm_quick_mode', timeout=5.0)
 
             # 创建服务客户端
-            service_client = rospy.ServiceProxy('/enable_lb_arm_quick_mode', SetBool)
+            service_client = rospy.ServiceProxy('/enable_lb_arm_quick_mode', changeLbQuickModeSrv)
 
-            # 调用服务
+            # 调用服务: quickMode 2 = 启动上肢快模式, 0 = 关闭
             rospy.loginfo(f"调用服务: {'启用' if enable else '禁用'}手臂快速模式")
-            response = service_client(enable)
+            req = changeLbQuickModeSrvRequest()
+            req.quickMode = 2 if enable else 0
+            response = service_client(req)
 
             # 处理响应
             if response.success:
@@ -364,14 +527,134 @@ class KuavoBaseRosEnv(gym.Env):
             rospy.logerr(f"服务调用异常: {e}")
             return False
 
+    def _call_enable_arm_traj_interpolator(self, enable: bool) -> bool:
+        """Enable the 500 Hz wheel-arm interpolator before quick-mode control."""
+        service_name = "/enable_arm_traj_interpolator"
+        try:
+            rospy.loginfo(
+                "等待服务 %s 可用，目标 enable=%s...", service_name, enable
+            )
+            rospy.wait_for_service(service_name, timeout=5.0)
+            service_client = rospy.ServiceProxy(service_name, SetBool)
+            response = service_client(enable)
+            if response.success:
+                rospy.loginfo("✓ wheel 手臂轨迹插补已设置为 %s", enable)
+                if response.message:
+                    rospy.loginfo("  消息: %s", response.message)
+                return True
+            rospy.logerr(
+                "✗ wheel 手臂轨迹插补设置失败 (enable=%s): %s",
+                enable,
+                response.message,
+            )
+        except (rospy.ROSException, rospy.ServiceException) as exc:
+            rospy.logerr("wheel 手臂轨迹插补服务调用失败: %s", exc)
+        return False
+
+    def _link_wheel_arm_traj(self, transport: int) -> bool:
+        """Select the wheel WBC arm-trajectory transport."""
+        from kuavo_humanoid_sdk.msg.kuavo_msgs.srv import SetIncrementalArmTrajLink, SetIncrementalArmTrajLinkRequest
+        service_name = "/humanoid_wheel/set_incremental_arm_traj_link"
+        try:
+            rospy.wait_for_service(service_name, timeout=5.0)
+            service_client = rospy.ServiceProxy(service_name, SetIncrementalArmTrajLink)
+            request = SetIncrementalArmTrajLinkRequest()
+            request.transport = transport
+            response = service_client(request)
+            if response.success:
+                rospy.loginfo(
+                    "✓ wheel 手臂动作 transport 已设置为 %d", transport
+                )
+                return True
+            rospy.logerr(
+                "wheel 手臂动作 transport=%d 设置失败: %s",
+                transport,
+                response.message,
+            )
+        except (rospy.ROSException, rospy.ServiceException) as exc:
+            rospy.logerr("wheel 手臂动作 transport 设置失败: %s", exc)
+        return False
+
+    def _restore_wheel_arm_control(self, *, force: bool = False) -> bool:
+        """Restore safe wheel-arm defaults without exposing unfiltered quick mode."""
+        if not force and not self._wheel_arm_cleanup_required:
+            return True
+
+        # Disable quick mode first. If this fails, keep interpolation and the
+        # transport in place: removing either while quickMode=2 may still be
+        # active would re-expose the step-and-velocity-spike path.
+        if not self._call_enable_arm_quick_mode(enable=False):
+            rospy.logerr(
+                "无法确认 quickMode=0；为安全起见保留插补和 transport，请重启 KSC"
+            )
+            return False
+
+        transport_reset = self._link_wheel_arm_traj(self.WHEEL_ARM_TRANSPORT_NONE)
+        interpolator_reset = self._call_enable_arm_traj_interpolator(False)
+        restored = transport_reset and interpolator_reset
+        self._wheel_arm_control_configured = False
+        self._wheel_arm_cleanup_required = not restored
+        if restored:
+            rospy.loginfo("✓ wheel 手臂 quick mode、transport 和插补已恢复默认值")
+        else:
+            rospy.logerr(
+                "quickMode 已关闭，但 transport/插补未完全复位；下次启动前请检查 KSC"
+            )
+        return restored
+
+    def _configure_wheel_arm_control(self) -> None:
+        """Atomically prepare the smoothed /kuavo_arm_traj quick-mode path."""
+        if self._wheel_arm_control_configured:
+            return
+
+        self._wheel_arm_cleanup_required = True
+        steps = (
+            (
+                self._call_enable_arm_traj_interpolator,
+                True,
+                "无法启用 wheel 手臂轨迹插补",
+            ),
+            (
+                self._link_wheel_arm_traj,
+                self.WHEEL_ARM_TRANSPORT_ROS,
+                "无法将 wheel 手臂输入绑定到 /kuavo_arm_traj",
+            ),
+            (
+                self._call_enable_arm_quick_mode,
+                True,
+                "无法启用 wheel 上肢 quickMode=2",
+            ),
+        )
+        for operation, value, error_message in steps:
+            if operation(value):
+                continue
+            self._restore_wheel_arm_control(force=True)
+            raise RuntimeError(f"{error_message}；为避免实机阶梯抖动，已中止控制初始化")
+
+        self._wheel_arm_control_configured = True
+        rospy.loginfo(
+            "✓ wheel 手臂控制链初始化完成: interpolator=true, "
+            "transport=/kuavo_arm_traj, quickMode=2"
+        )
+
     def _enter_external_control_mode(self):
         self.robot.set_external_control_arm_mode()
         print("set_external_control_arm_mode", self.robot_state.arm_control_mode())
+        # Wheel quick mode and the /kuavo_arm_traj -> WBC route are needed by
+        # direct WBC execution and by DAgger's single-output arbitration path.
+        # Keep the legacy 5w control architecture untouched otherwise.
+        if self.platform_type == "5w" and self.dagger_on:
+            self._configure_wheel_arm_control()
         if self.direct_to_wbc:
             if self.platform_type in ["4pro","5"]:
                 self._set_direct_to_wbc(1)
-            else:
-                self._call_enable_arm_quick_mode(enable=True)
+            elif not self.dagger_on:
+                # 100 Hz 位置流必须配合 500 Hz 插补，否则 quickMode=2 会阶梯抖动。
+                self._wheel_arm_cleanup_required = True
+                if not self._call_enable_arm_traj_interpolator(True):
+                    raise RuntimeError("无法启用 wheel 手臂轨迹插补，已中止 quickMode=2")
+                if not self._call_enable_arm_quick_mode(enable=True):
+                    raise RuntimeError("无法启用 wheel 上肢 quickMode=2")
 
 
     # ==========================================================
@@ -385,6 +668,9 @@ class KuavoBaseRosEnv(gym.Env):
     # 子函数 3. 末端执行器（夹爪）复位
     # ==========================================================
     def _reset_eef(self):
+        if self.single_arm_dagger:
+            self.control_active_eef_positions([0, 100, 0, 0, 0, 0] if self.eef_type == "qiangnao" else [0])
+            return
         if self.which_arm == 'both':
             if self.eef_type == 'qiangnao':
                 self.qiangnao.control(target_positions=[0, 100, 0, 0, 0, 0, 0, 100, 0, 0, 0, 0], target_velocities=None, target_torques=None)
@@ -451,6 +737,8 @@ class KuavoBaseRosEnv(gym.Env):
     
     def check_action(self, action, mode='default'):
         if mode == 'default':  # 比较 action_space
+            if self.dagger_on:
+                action = self.action_layout.validate(action)
             if len(action) != len(self.action_space.low):
                 raise ValueError(f"action shape must be {len(self.action_space.low)}")
             if np.any(action < self.action_space.low) or np.any(action > self.action_space.high):
@@ -464,6 +752,10 @@ class KuavoBaseRosEnv(gym.Env):
         raise ValueError(f"Unsupported mode: {mode}")
 
     def step(self, action):
+        session = getattr(self, "dagger_session", None)
+        session = session if session is not None and session.active else None
+        if session is not None:
+            session.check_interrupt()
         t0 = time.time()
         log_robot.info(f"action: {action}")
         # check clip action in action space
@@ -478,7 +770,15 @@ class KuavoBaseRosEnv(gym.Env):
         action_components = self._split_action(action)
         self.cur_joint_angles_action = self._full_arm_target(action_components)
 
-        if not self.direct_to_wbc:
+        if self.interp_threaded:
+            # 目标交给下发线程，本帧立即返回，不再在推理线程里阻塞插值。
+            self.set_action_target(action)
+            # 下发线程已按 control_rate 独占下发，这里只需把“策略步进频率”限回
+            # ros_rate。若推理本身慢于 ros_rate，rospy.Rate 会立即返回，于是自然
+            # 变成“按模型推理时间更新”。少了这一句外层 rollout 会自由狂奔（实测
+            # 63.77 step/s），策略闭环频率翻倍且不均匀，反而放大抖动。
+            self.rate.sleep()
+        elif not self.direct_to_wbc:
             self.exec_action(action)
             self.rate.sleep()
         else:
@@ -499,12 +799,25 @@ class KuavoBaseRosEnv(gym.Env):
                 for i in range(num_inter_points):
                     alpha = (i + 1) / num_inter_points
                     inter_joints = (1 - alpha) * current_q + alpha * target_joints
-                    self.safe_control_arm(inter_joints)
-                    if self.use_5w_wholebody:
-                        inter_lower = (1 - alpha) * current_lower + alpha * target_lower
-                        self.safe_control_lower_body(inter_lower)
-                    if self.use_5w_base_move:
-                        self.safe_control_base(alpha * action_components["base_velocity"])
+                    inter_lower = ((1 - alpha) * current_lower + alpha * target_lower
+                                   if self.use_5w_wholebody else None)
+                    if session is not None:
+                        point = action.copy()
+                        for side in self._controlled_sides:
+                            physical = slice(0, 7) if side == "left" else slice(7, 14)
+                            section = self.action_layout.action_slice(side)
+                            point[section.start:section.start + 7] = inter_joints[physical]
+                        if self.use_5w_wholebody:
+                            point[self.action_layout.lower_body_slice] = inter_lower
+                        if self.use_5w_base_move:
+                            point[self.action_layout.state_dim:] = alpha * action_components["base_velocity"]
+                        session.submit(point, channels=("arm", "lower", "base"))
+                    else:
+                        self.safe_control_arm(inter_joints)
+                        if self.use_5w_wholebody:
+                            self.safe_control_lower_body(inter_lower)
+                        if self.use_5w_base_move:
+                            self.safe_control_base(alpha * action_components["base_velocity"])
                     self.control_rate.sleep()
 
                 self.exec_action(action)
@@ -544,17 +857,30 @@ class KuavoBaseRosEnv(gym.Env):
         # === 6. 奖励与返回 ===
         reward = self.compute_reward()
         return obs, reward, False, False, {}
-    
-    
+
     def _record_sleep_time(self, t_start):
         self.sleep_time = time.time() - t_start
         self.average_sleep_time += self.sleep_time
         log_robot.info(f"rate.sleep time: {self.sleep_time:.3f}s")
 
-    def safe_control_arm(self, target_position):
+    def safe_control_arm(self, target_position, *, arm_velocity=None):
+        if arm_velocity is not None:
+            arm_velocity = validate_arm_vector(arm_velocity, "Arm velocity")
+        if self.single_arm_dagger:
+            target_position = validate_arm_vector(target_position, "Arm position")
+            inactive = slice(7, 14) if self.which_arm == "left" else slice(0, 7)
+            target_position[inactive] = self._held_arm[inactive]
+            if arm_velocity is not None:
+                arm_velocity[inactive] = 0.0
         try:
+            if arm_velocity is not None:
+                if self._arm_velocity_transport is None:
+                    raise RuntimeError("Arm velocity transport was not initialized")
+                return self._arm_velocity_transport.send(target_position, arm_velocity)
             self.robot.control_arm_joint_positions(target_position)
         except RuntimeError as e:
+            if arm_velocity is not None:
+                raise
             # 当机器人处于 command_pose_world 状态（底盘移动）时，无法控制手臂
             if "must be in stance state" in str(e):
                 log_robot.warning(f"⚠️  无法发送手臂命令：机器人当前状态不允许 (可能正在底盘移动)")
@@ -569,9 +895,16 @@ class KuavoBaseRosEnv(gym.Env):
             target_position[self.lower_body_lock_mask] = self.lower_body_lock_target[
                 self.lower_body_lock_mask
             ]
+        # 下发线程也会调用本方法，缓存需加锁，避免与 step() 路径互相覆盖。
+        with self._last_cmd_lock:
+            self._last_lower_cmd = np.asarray(target_position, dtype=float).copy()
         try:
-            self.robot.control_wheel_lower_joint(np.rad2deg(target_position).tolist())
+            accepted = self.robot.control_wheel_lower_joint(np.rad2deg(target_position).tolist())
+            if self.dagger_on and accepted is False:
+                raise RuntimeError("5W lower-body command was rejected; DAgger step is unconfirmed")
         except RuntimeError as e:
+            if self.dagger_on:
+                raise
             if "must be in stance state" in str(e):
                 log_robot.warning("Unable to send 5W lower-body command in the current robot state")
             else:
@@ -592,6 +925,8 @@ class KuavoBaseRosEnv(gym.Env):
         msg.angular.x = 0.0
         msg.angular.y = 0.0
         msg.angular.z = float(velocity[2])
+        with self._last_cmd_lock:
+            self._last_base_cmd = velocity.copy()
         self.cmd_vel_pub.publish(msg)
 
     def stop_base(self):
@@ -599,10 +934,63 @@ class KuavoBaseRosEnv(gym.Env):
         if getattr(self, 'use_5w_base_move', False) and hasattr(self, 'cmd_vel_pub'):
             self.safe_control_base(np.zeros(BASE_VELOCITY_DOF, dtype=float))
 
+    def stop_arm_velocity(self):
+        """Hold the last sent position with zero velocity on pause/exit."""
+        if (getattr(self, '_arm_velocity_transport', None) is not None
+                and self.last_sent_action is not None):
+            target = self._full_arm_target(self._split_action(self.last_sent_action))
+            _, velocity = self.safe_control_arm(target, arm_velocity=np.zeros(14))
+            self.last_sent_arm_velocity = velocity.copy()
+
+    def send_dagger_command(self, action, *, arm_velocity=None, channels):
+        """Final selection uses the same checked SDK APIs as dev's publishers."""
+        original = np.asarray(action).copy()
+        action = self.check_action(original.copy(), mode='default')
+        components = self._split_action(action)
+        actual = (self.last_sent_action.copy() if self.last_sent_action is not None
+                  else self.dagger_session._actual.copy())
+        if "arm" in channels:
+            target = self._full_arm_target(components)
+            if arm_velocity is None:
+                self.safe_control_arm(target)
+                self.last_sent_arm_velocity = None
+            else:
+                velocity = validate_arm_vector(arm_velocity, "Arm velocity")
+                unclipped = self._full_arm_target(self._split_action(original))
+                velocity[np.abs(unclipped - target) > 1e-10] = 0.0
+                target, velocity = self.safe_control_arm(target, arm_velocity=velocity)
+                self.last_sent_arm_velocity = velocity.copy()
+            for side in self._controlled_sides:
+                section = self.action_layout.action_slice(side)
+                physical = slice(0, 7) if side == "left" else slice(7, 14)
+                actual[section.start:section.start + 7] = target[physical]
+        def send_eef():
+            if "eef" in channels:
+                empty = np.zeros(self.eef_dof_per_side)
+                self._control_eef(components.get("left", {}).get("eef", empty),
+                                  components.get("right", {}).get("eef", empty))
+                for side in self._controlled_sides:
+                    section = self.action_layout.action_slice(side)
+                    actual[section.start + 7:section.stop] = action[section.start + 7:section.stop]
+        if not self.interp_threaded:
+            send_eef()
+        if "lower" in channels and self.use_5w_wholebody:
+            self.safe_control_lower_body(components["lower_body"])
+            actual[self.action_layout.lower_body_slice] = self._last_lower_cmd
+        if "base" in channels and self.use_5w_base_move:
+            self.safe_control_base(components["base_velocity"])
+            actual[self.action_layout.state_dim:] = self._last_base_cmd
+        if self.interp_threaded:
+            send_eef()
+        self.last_sent_action = actual.copy()
+        return actual
+
     def exec_action(self, action):
         """执行机械臂与末端执行器动作"""
-        if self.direct_to_wbc:
-            action = self.low_pass_filter.update(action)
+        session = getattr(self, "dagger_session", None)
+        if session is not None and session.active:
+            session.submit(action)
+            return
         components = self._split_action(action)
         target_position = self._full_arm_target(components)
         self.safe_control_arm(target_position)
@@ -617,8 +1005,30 @@ class KuavoBaseRosEnv(gym.Env):
 
 
 
+    def control_active_eef_positions(self, positions):
+        """Compose native 0..100 commands with the locked complete inactive hand."""
+        values = np.asarray(positions, dtype=np.float64)
+        dim = 6 if self.eef_type == "qiangnao" else 1
+        if values.shape != (dim,) or not np.all(np.isfinite(values)):
+            raise ValueError(f"Expected {dim} finite end-effector positions")
+        if np.any(values < 0) or np.any(values > 100):
+            raise ValueError("End-effector positions must be within 0..100")
+        device = self.qiangnao if self.eef_type == "qiangnao" else self.lejuclaw
+        # Same-side SDK calls may fill the other side from a zero-initialized cache.
+        # Always send an explicit complete target with the inactive pose preserved.
+        full = self._held_eef.copy()
+        start = 0 if self.which_arm == "left" else dim
+        full[start:start + dim] = values
+        device.control(target_positions=full.tolist(), target_velocities=None, target_torques=None)
+
     def _control_eef(self, left_eef, right_eef):
         """根据 eef_type 控制不同的末端执行器"""
+        if self.single_arm_dagger:
+            value = float(np.asarray(left_eef if self.which_arm == "left" else right_eef).reshape(-1)[0]) * 100
+            positions = [value, 100, value, value, value, value] if self.eef_type == "qiangnao" else [value]
+            self.control_active_eef_positions(positions)
+            return
+
         left_eef = np.asarray(left_eef, dtype=float).reshape(-1)
         right_eef = np.asarray(right_eef, dtype=float).reshape(-1)
         if self.eef_type == 'rq2f85':
@@ -655,26 +1065,24 @@ class KuavoBaseRosEnv(gym.Env):
 
             def _expand(values: np.ndarray, hand_slice: slice):
                 if values.size == 1:
-                    # The single-DOF representation is a normalized open/close
-                    # amount, so it must stay within [0, 1].
+                    # 模型输出是归一化开合量，先夹到 [0, 1]。
                     amount = float(np.clip(values[0], 0.0, 1.0))
                     positions = (
                         self.sg100_open_pose[hand_slice] * (1.0 - amount)
                         + self.sg100_close_pose[hand_slice] * amount
                     )
-                    mode = (SG100HandCommand.MODE_JOINT_IMPEDANCE
-                            if amount > self.sg100_force_threshold
-                            else SG100HandCommand.MODE_JOINT_POSITION)
-                    modes = [mode] * 11
                 elif values.size == 11:
-                    # Full-hand datasets store each raw joint angle divided by
-                    # 1.57. Some SG100 joints legitimately use negative values
-                    # (for example right thumb_j2), so do not apply the scalar
-                    # open/close clipping here.
-                    positions = values * 1.57
-                    modes = [SG100HandCommand.MODE_JOINT_POSITION] * 11
+                    # 逐关节动作已是弧度，直接透传；仅按各关节实测合法区间限幅。
+                    positions = values
                 else:
                     raise ValueError(f"SG100 action must have 1 or 11 values per hand, got {values.size}")
+                # SG100 各关节量程不同（拇指 MCP 为负、小指 MCP_ABD 约 ±3.1），
+                # 不能统一 clip 到 [0, 1.57]。
+                positions = np.clip(
+                    positions, self.sg100_joint_min[hand_slice], self.sg100_joint_max[hand_slice]
+                )
+                # SG100 驱动只支持关节位置模式，不使用阻抗模式。
+                modes = [SG100HandCommand.MODE_JOINT_POSITION] * 11
                 return positions.tolist(), modes
 
             left_positions, left_modes = _expand(left_eef, slice(0, 11))
@@ -709,7 +1117,7 @@ class KuavoBaseRosEnv(gym.Env):
                 obs_from_buffer = self.obs_buffer.get_aligned_obs(reference_keys=None, max_dt=float('inf'),ratio=self.ratio)
         else:
             obs_from_buffer = self.obs_buffer.get_latest_obs()
-        
+
         for k,v in obs_from_buffer.items():
             # remap key
             if 'depth' in k:
@@ -719,7 +1127,7 @@ class KuavoBaseRosEnv(gym.Env):
             else:
                 self.arm_state[f"{k}"] = v
 
-        if self.is_binary:
+        if self.is_binary and self.eef_type != "sg100":
             self.arm_state['gripper'] = np.where(self.arm_state['gripper']>0.5, 1, 0)
 
         assert len(self.arm_state.keys()) >= 2, f"arm_state must have exactly 2 elements, but got {len(self.arm_state.keys())}"
@@ -751,12 +1159,33 @@ class KuavoBaseRosEnv(gym.Env):
         log_robot.info(f"STATE: contained {state_keys}, concated value: {obs['observation.state']}")
 
         obs["observation.state"] = torch.from_numpy(obs["observation.state"]).float().unsqueeze(0)
-        return obs    
+        return obs
 
     def close(self):
         """关闭环境，释放资源"""
         log_robot.info("Closing KuavoBaseRosEnv...")
         try:
+            if getattr(self, "dagger_session", None) is not None:
+                self.dagger_session.end_episode()
+            # 必须先停下发线程，再释放 ROS 资源，否则线程可能在 publisher 销毁后继续下发。
+            if getattr(self, "control_loop", None) is not None:
+                self.control_loop.stop()
+                self.control_loop = None
+            if self.dagger_on or self.single_arm_dagger:
+                try:
+                    self.stop_arm_velocity()
+                except Exception as e:
+                    log_robot.error(f"Unable to send zero arm velocity during close: {e}")
+                if getattr(self, '_dagger_arbiter', None) is not None:
+                    self._dagger_arbiter.close()
+                if hasattr(self, 'lejuclaw'):
+                    self.lejuclaw.close()
+            if getattr(self, '_wheel_arm_cleanup_required', False):
+                if not self._restore_wheel_arm_control():
+                    log_robot.error(
+                        "wheel 手臂控制模式未完全复位；再次启动 eval 前必须重启或检查 KSC"
+                    )
+
             self.stop_base()
             if hasattr(self, 'obs_buffer'):
                 self.obs_buffer.stop_subscribers()
@@ -778,6 +1207,9 @@ class KuavoBaseRosEnv(gym.Env):
         except Exception as e:
             log_robot.error(f"Error closing KuavoBaseRosEnv: {e}")
             traceback.print_exc()
+        finally:
+            if getattr(self, '_arm_velocity_transport', None) is not None:
+                self._arm_velocity_transport.close()
 
     def __enter__(self):
         """上下文管理器入口"""
@@ -800,7 +1232,7 @@ class LejuClaw:
         cmd = lejuClawCommand()
         cmd.data.name = ['left_claw', 'right_claw']
         
-        target_positions = [max(0.0, min(100.0, pos)) for pos in target_positions]
+        target_positions = [max(0.0, min(100.0, float(pos))) for pos in target_positions]
         target_velocities = self._get_default_velocities(target_velocities, 2)
         target_torques = self._get_default_torques(target_torques, 2)
         

@@ -51,6 +51,7 @@ class LingbotVLAConfig(PretrainedConfig):
         max_action_dim: int = 14,
         max_state_dim: int = 14,
         chunk_size: int = 50,
+        rtc_training_max_delay: int = 0,
         vlm_causal: bool = False,
         tokenizer_max_length: int = 48,
         loss_type: str = "fm",
@@ -132,6 +133,9 @@ class LingbotVLAConfig(PretrainedConfig):
         self.max_action_dim = max_action_dim
         self.max_state_dim = max_state_dim
         self.chunk_size = chunk_size
+        if type(rtc_training_max_delay) is not int or not 0 <= rtc_training_max_delay < chunk_size:
+            raise ValueError("rtc_training_max_delay must be in [0, chunk_size)")
+        self.rtc_training_max_delay = rtc_training_max_delay
         self.n_action_steps = chunk_size
         self.vlm_causal = vlm_causal
         self.align_params = align_params

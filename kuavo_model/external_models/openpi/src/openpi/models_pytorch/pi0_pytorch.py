@@ -1,3 +1,12 @@
+# Locate the shared Kuavo RTC helpers when launched from this vendored repo.
+from pathlib import Path as _RTCPath
+import sys as _rtc_sys
+for _rtc_parent in _RTCPath(__file__).resolve().parents:
+    if (_rtc_parent / "kuavo_model" / "rtc").is_dir():
+        if str(_rtc_parent) not in _rtc_sys.path:
+            _rtc_sys.path.insert(0, str(_rtc_parent))
+        break
+
 import logging
 import math
 
@@ -263,9 +272,11 @@ class PI0Pytorch(nn.Module):
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
-            timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0, device=timestep.device
+            timestep.reshape(-1), self.action_in_proj.out_features, min_period=4e-3, max_period=4.0, device=timestep.device
         )
         time_emb = time_emb.type(dtype=timestep.dtype)
+        if timestep.ndim == 2:
+            time_emb = time_emb.reshape(*timestep.shape, -1)
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
@@ -274,7 +285,8 @@ class PI0Pytorch(nn.Module):
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
         if not self.pi05:
-            time_emb = time_emb[:, None, :].expand_as(action_emb)
+            if timestep.ndim == 1:
+                time_emb = time_emb[:, None, :].expand_as(action_emb)
             action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
             # Apply MLP layers
@@ -328,6 +340,11 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
+        rtc_mask = None
+        if self.config.rtc_training_max_delay > 0:
+            from kuavo_model.rtc.torch import training_condition
+            x_t, time, rtc_mask = training_condition(actions, noise, time, self.config.rtc_training_max_delay)
+
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
@@ -371,10 +388,16 @@ class PI0Pytorch(nn.Module):
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+        if rtc_mask is not None:
+            from kuavo_model.rtc.torch import suffix_loss
+            losses = suffix_loss(losses, rtc_mask)
+        return losses
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def sample_actions(self, device, observation, noise=None, num_steps=10, *,
+                       rtc_prefix=None, rtc_delay=0, rtc_horizon=10, rtc_mode=None,
+                       rtc_schedule="exp", rtc_max_guidance_weight=10.0) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
@@ -406,16 +429,22 @@ class PI0Pytorch(nn.Module):
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
-            )
-
-            # Euler step - use new tensor assignment instead of in-place operation
+            frozen = None
+            if rtc_mode == "trained":
+                from kuavo_model.rtc.torch import trained_step
+                x_t, expanded_time, frozen = trained_step(
+                    x_t, time, rtc_prefix, rtc_delay, self.config.rtc_training_max_delay)
+            denoise = lambda x: self.denoise_step(state, prefix_pad_masks, past_key_values, x, expanded_time)
+            if rtc_mode == "guided":
+                from kuavo_model.rtc.torch import guided_velocity
+                v_t = guided_velocity(denoise, x_t, time, rtc_prefix, delay=rtc_delay, horizon=rtc_horizon,
+                                      schedule=rtc_schedule, max_guidance_weight=rtc_max_guidance_weight)
+            else:
+                v_t = denoise(x_t)
             x_t = x_t + dt * v_t
+            if frozen is not None:
+                from kuavo_model.rtc.torch import finish_trained_step
+                x_t = finish_trained_step(x_t, frozen)
             time += dt
         return x_t
 

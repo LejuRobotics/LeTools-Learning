@@ -176,6 +176,11 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             "timestamp": time.time(),
         }
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
+        if config.model.rtc_training_max_delay > 0:
+            import json
+            (tmp_ckpt_dir / "rtc_training.json").write_text(json.dumps({
+                "rtc_training_max_delay": config.model.rtc_training_max_delay,
+            }))
 
         # save norm stats
         norm_stats = data_config.norm_stats

@@ -382,7 +382,7 @@ class Gr00tPolicy(BasePolicy):
 
         Args:
             observation: Batched observation dictionary
-            options: Optional parameters (currently unused)
+            options: RTC mode, delay and optional absolute action prefix.
 
         Returns:
             Tuple of (actions_dict, info_dict)
@@ -399,26 +399,29 @@ class Gr00tPolicy(BasePolicy):
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(self.processor(messages))
 
-        # Step 3: Collate processed inputs into a single batch for model.
-        # RTC operates in normalized model action space, before action decoding.
+        # Step 3: Collate processed inputs into a single batch for model
         collated_inputs = self.collate_fn(processed_inputs)
-        model_options = options
-        if options is not None and options.get("previous_action") is not None:
-            previous_action = np.asarray(options["previous_action"], dtype=np.float32)
-            if previous_action.ndim == 2:
-                previous_action = previous_action[None, ...]
-            if previous_action.ndim != 3:
-                raise ValueError(f"RTC previous_action must be [B, T, D], got {previous_action.shape}")
-            collated_inputs["inputs"]["action"] = torch.from_numpy(previous_action)
-            model_options = {k: v for k, v in options.items() if k != "previous_action"}
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
-        rtc_mode = str(model_options["rtc_mode"]) if model_options is not None and "rtc_mode" in model_options else ""
-        inference_context = torch.no_grad() if rtc_mode == "vjp" else torch.inference_mode()
-
-        # Step 4: Run model inference to predict actions
-        with inference_context:
-            model_pred = self.model.get_action(**collated_inputs, options=model_options)
+        # Re-encode physical leftovers with THIS observation's state, using the
+        # exact processor that supplied relative-action training targets.
+        rtc = dict(options or {})
+        absolute_prefix = rtc.pop("absolute_prefix", None)
+        if absolute_prefix is not None:
+            encoded = []
+            keys = self.modality_configs["action"].modality_keys
+            for index, raw_state in enumerate(states):
+                groups = {key: np.asarray(absolute_prefix[key])[index] for key in keys}
+                normalized = self.processor.state_action_processor.apply_action(
+                    groups, self.embodiment_tag.value, state=raw_state,
+                )
+                prefix = np.concatenate([normalized[key] for key in keys], axis=-1)
+                prefix = np.pad(prefix, ((0, 0), (0, self.model.config.max_action_dim - prefix.shape[-1])))
+                encoded.append(prefix)
+            rtc["prefix"] = torch.as_tensor(np.stack(encoded), device=self.model.device, dtype=self.model.dtype)
+        # Guided VJP needs ordinary tensors, not tensors created by inference_mode.
+        with torch.inference_mode(rtc.get("mode") != "guided"), torch.no_grad():
+            model_pred = self.model.get_action(**collated_inputs, options=rtc if rtc else None)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
@@ -433,7 +436,19 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {"action": normalized_action.cpu().numpy()}
+        info = {}
+        if rtc.get("mode") is not None:
+            from copy import deepcopy
+            self._rtc_previous_states = deepcopy(batched_states)
+            info = {"original_actions": normalized_action.detach().cpu().numpy().copy(),
+                    "action_context": {"state": deepcopy(batched_states)}}
+        return casted_action, info
+
+    def decode_rtc_prefix(self, original, context=None):
+        state = getattr(self, "_rtc_previous_states", None) if context is None else context["state"]
+        if state is None:
+            raise ValueError("RTC prefix has no previous GR00T observation anchor")
+        return self.processor.decode_action(np.asarray(original)[None], self.embodiment_tag, state)
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.

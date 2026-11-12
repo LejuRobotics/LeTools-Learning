@@ -67,8 +67,13 @@ def save_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    rtc_training_max_delay: int = 0,
 ):
     def save_assets(directory: epath.Path):
+        if rtc_training_max_delay > 0:
+            import json
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "rtc_training.json").write_text(json.dumps({"rtc_training_max_delay": rtc_training_max_delay}))
         # Save the normalization stats.
         data_config = data_loader.data_config()
         norm_stats = data_config.norm_stats

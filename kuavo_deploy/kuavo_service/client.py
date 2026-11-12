@@ -225,13 +225,6 @@ class ExternalRobotInferenceClient(BaseInferenceClient):
             raise RuntimeError(f"{response['error']} | request_keys={list(observations.keys())}")
         return response
 
-    def select_action_chunk_rtc(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        response = self.call_endpoint("select_action_chunk_rtc", request)
-        if isinstance(response, dict) and response.get("error"):
-            obs = request.get("observation", {})
-            raise RuntimeError(f"{response['error']} | request_keys={list(obs.keys())}")
-        return response
-        
 
 # policy client
 class PolicyClient:
@@ -311,29 +304,18 @@ class PolicyClient:
     def predict_action_chunk(self, obs_dict):
         return self.select_action_chunk(obs_dict)
 
-    def select_action_chunk_rtc(
-        self,
-        obs_dict,
-        *,
-        prev_chunk_leftover,
-        inference_delay,
-        execution_horizon,
-        rtc_options,
-    ):
-        self._pending_actions.clear()
-        result = self.policy.select_action_chunk_rtc(
-            {
-                "observation": self._prepare_obs(obs_dict),
-                "prev_chunk_leftover": prev_chunk_leftover,
-                "inference_delay": int(inference_delay),
-                "execution_horizon": int(execution_horizon),
-                "rtc_options": dict(rtc_options),
-            }
-        )
-        if not isinstance(result, dict) or not {"processed_actions", "original_actions"} <= result.keys():
-            raise ValueError("Server RTC result must contain processed_actions and original_actions")
-        result = dict(result)
-        result["processed_actions"] = self._to_action_chunk_tensor(result["processed_actions"])
+    def predict_action_chunk_rtc(self, obs_dict, *, previous_original, previous_absolute, previous_context, rtc):
+        result = self.policy.call_endpoint("select_action_chunk_rtc", {
+            "observation": self._prepare_obs(obs_dict),
+            "previous_original": previous_original,
+            "previous_absolute": previous_absolute,
+            "previous_context": previous_context,
+            "rtc": rtc,
+        })
+        if isinstance(result, dict) and result.get("error"):
+            raise RuntimeError(result["error"])
+        if not isinstance(result, dict) or not {"original_actions", "processed_actions"} <= result.keys():
+            raise ValueError("RTC server must return both original_actions and processed_actions")
         return result
 
 

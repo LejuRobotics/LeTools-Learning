@@ -9,6 +9,15 @@ from transformers.models.auto import CONFIG_MAPPING
 from transformers.cache_utils import Cache
 from transformers.utils import logging
 
+# Locate the shared Kuavo RTC helpers when launched from this vendored repo.
+from pathlib import Path as _RTCPath
+import sys as _rtc_sys
+for _rtc_parent in _RTCPath(__file__).resolve().parents:
+    if (_rtc_parent / "kuavo_model" / "rtc").is_dir():
+        if str(_rtc_parent) not in _rtc_sys.path:
+            _rtc_sys.path.insert(0, str(_rtc_parent))
+        break
+
 from .configuration_lingbot_vla import LingbotVLAV2Config
 from .qwen3vl_in_vla import (
     Qwen3VLForConditionalGeneration,
@@ -781,6 +790,7 @@ class FlowMatchingV2(FlowMatchingV1):
         future_video_targets=None,
         future_video_cls_targets=None,
         future_video_current_patch=None,
+        return_rtc_mask=False,
     ) -> Tensor:
         dtype = state.dtype
         device = state.device
@@ -792,6 +802,11 @@ class FlowMatchingV2(FlowMatchingV1):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
+
+        rtc_mask = None
+        if self.config.rtc_training_max_delay > 0:
+            from kuavo_model.rtc.torch import training_condition
+            x_t, time, rtc_mask = training_condition(actions, noise, time, self.config.rtc_training_max_delay)
 
         (
             prefix_embs,
@@ -910,12 +925,17 @@ class FlowMatchingV2(FlowMatchingV1):
         elif loss_type == "L1_fm":
             losses = F.l1_loss(u_t, v_t, reduction="none")
 
+        if rtc_mask is not None:
+            from kuavo_model.rtc.torch import suffix_loss
+            losses = losses * rtc_mask if return_rtc_mask else suffix_loss(losses, rtc_mask)
+
         seq_wise_loss, router_z_loss, moe_metrics = self._moe_losses_and_metrics(
             router_logits_list, losses
         )
         if align_metrics:
             moe_metrics.update(align_metrics)
-        return losses, loss_depth, loss_future_depth, loss_future_video, depth_preds, seq_wise_loss, router_z_loss, moe_metrics, future_depth_preds, future_video_preds, current_video_preds
+        result = (losses, loss_depth, loss_future_depth, loss_future_video, depth_preds, seq_wise_loss, router_z_loss, moe_metrics, future_depth_preds, future_video_preds, current_video_preds)
+        return (*result, rtc_mask) if return_rtc_mask else result
 
     def sample_actions(
         self,
@@ -926,6 +946,8 @@ class FlowMatchingV2(FlowMatchingV1):
         state,
         noise=None,
         image_grid_thw=None,
+        rtc_prefix=None,
+        rtc_options=None,
     ) -> Tensor:
         """Do a full Qwen3-VL inference forward and compute the action."""
         bsize = state.shape[0]
@@ -972,8 +994,13 @@ class FlowMatchingV2(FlowMatchingV1):
         x_t = noise
         time = torch.tensor(1.0, dtype=dtype, device=device)
         count = 0
+        rtc = rtc_options or {}
+        mode = rtc.get("mode")
+        delay = int(rtc.get("inference_delay", 0))
         predict_velocity_fn = self.predict_velocity
-        if getattr(self, "_use_compile_predict_velocity", False):
+        # trained_step runs eagerly outside, so trained mode only feeds shape-stable
+        # tensors here; guided mode's VJP closure stays uncompiled.
+        if mode != "guided" and getattr(self, "_use_compile_predict_velocity", False):
             predict_velocity_fn = getattr(self, "_compiled_predict_velocity", None)
             if predict_velocity_fn is None:
                 predict_velocity_fn = torch.compile(
@@ -987,17 +1014,28 @@ class FlowMatchingV2(FlowMatchingV1):
         while time >= -dt / 2:
             count += 1
             expanded_time = time.expand(bsize)
-            v_t = predict_velocity_fn(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
+            frozen = None
+            if mode == "trained":
+                from kuavo_model.rtc.torch import trained_step
+                x_t, expanded_time, frozen = trained_step(
+                    x_t, time, rtc_prefix, delay, self.config.rtc_training_max_delay)
+            denoise = lambda x: predict_velocity_fn(
+                state, prefix_pad_masks, past_key_values, x, expanded_time,
                 prefix_position_ids=prefix_position_ids,
             )
-
-            x_t += dt * v_t
-            time += dt
+            if mode == "guided":
+                from kuavo_model.rtc.torch import guided_velocity
+                v_t = guided_velocity(
+                    denoise, x_t, time, rtc_prefix, delay=delay,
+                    horizon=int(rtc.get("execution_horizon", 10)), schedule=rtc.get("prefix_attention_schedule", "exp"),
+                    max_guidance_weight=float(rtc.get("max_guidance_weight", 10)))
+            else:
+                v_t = denoise(x_t)
+            x_t = x_t + dt * v_t
+            if frozen is not None:
+                from kuavo_model.rtc.torch import finish_trained_step
+                x_t = finish_trained_step(x_t, frozen)
+            time = time + dt
         print(f"Denoise {count} steps")
         return x_t
 
@@ -1269,6 +1307,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
             future_depth_preds,
             future_video_preds,
             current_video_preds,
+            rtc_suffix_mask,
         ) = self.model.forward(
             images,
             img_masks,
@@ -1285,12 +1324,15 @@ class LingbotVlaV2Policy(PreTrainedModel):
             future_video_targets=future_video_targets,
             future_video_cls_targets=future_video_cls_targets,
             future_video_current_patch=future_video_current_patch,
+            return_rtc_mask=True,
         )
 
         if joint_mask is not None:
             if "repeat" in self.config.loss_type:
                 joint_mask = joint_mask.repeat(2, 1, 1)
             assert len(joint_mask.shape) == 3
+            if rtc_suffix_mask is not None:
+                joint_mask = joint_mask * rtc_suffix_mask
             
             masked_losses = losses * joint_mask
             valid_counts = joint_mask.sum(dim=(1, 2)).clamp(min=1)
@@ -1298,8 +1340,13 @@ class LingbotVlaV2Policy(PreTrainedModel):
             loss_vla = masked_losses.sum() / joint_mask.sum().clamp(min=1)
         else:
             losses = losses[:, :, : self.config.action_dim]
-            batch_mean_losses = losses.mean(dim=(1, 2))
-            loss_vla = losses.mean()
+            if rtc_suffix_mask is None:
+                batch_mean_losses = losses.mean(dim=(1, 2))
+                loss_vla = losses.mean()
+            else:
+                valid = rtc_suffix_mask.expand_as(losses)
+                batch_mean_losses = losses.sum(dim=(1, 2)) / valid.sum(dim=(1, 2)).clamp_min(1)
+                loss_vla = losses.sum() / valid.sum().clamp_min(1)
 
         loss_dict["batch_mean_losses"] = batch_mean_losses.detach()
         total_loss = (

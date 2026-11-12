@@ -55,6 +55,7 @@ class FinetuneConfig:
     """If True, fine-tune the multimodal projector layers that map vision/language features to a shared space."""
 
     tune_diffusion_model: bool = True
+    rtc_training_max_delay: int = 0
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
 
     state_dropout_prob: float = 0.2

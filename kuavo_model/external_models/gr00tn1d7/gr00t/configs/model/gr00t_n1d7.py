@@ -73,6 +73,7 @@ class Gr00tN1d7Config(PretrainedConfig):
     max_state_dim: int = 132  # Default from state_shape
     max_action_dim: int = 132  # Default from action_shape
     action_horizon: int = 40
+    rtc_training_max_delay: int = 0
     hidden_size: int = 1024
     input_embedding_dim: int = 1536
 
@@ -135,6 +136,9 @@ class Gr00tN1d7Config(PretrainedConfig):
                     setattr(self, f.name, f.default)
                 elif getattr(f, "default_factory", MISSING) is not MISSING:
                     setattr(self, f.name, f.default_factory())
+
+        if type(self.rtc_training_max_delay) is not int or not 0 <= self.rtc_training_max_delay < self.action_horizon:
+            raise ValueError("rtc_training_max_delay must be in [0, action_horizon)")
 
     def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
         """Return a dictionary representation of this config, optionally excluding augmentation keys."""

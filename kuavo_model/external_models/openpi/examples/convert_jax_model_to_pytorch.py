@@ -532,6 +532,17 @@ def convert_pi0_checkpoint(
     # Save model weights as SafeTensors using save_model to handle tied weights
     safetensors.torch.save_model(pi0_model, os.path.join(output_path, "model.safetensors"))
 
+    # The weights keep RTC conditioning after conversion; retain the evidence
+    # of training even when the caller uses a non-RTC config template.
+    rtc_destination = pathlib.Path(output_path) / "rtc_training.json"
+    for rtc_source in (pathlib.Path(checkpoint_dir) / "rtc_training.json",
+                       pathlib.Path(checkpoint_dir) / "assets" / "rtc_training.json"):
+        if rtc_source.is_file():
+            shutil.copyfile(rtc_source, rtc_destination)
+            break
+    else:
+        rtc_destination.unlink(missing_ok=True)
+
     # Copy assets folder if it exists
     assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
     if assets_source.exists():

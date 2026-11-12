@@ -27,7 +27,7 @@ from pprint import pprint
 import os
 import glob
 from collections import defaultdict
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 from numpy.lib.stride_tricks import sliding_window_view
 from .config_platform import get_arm_joint_slice, DEFAULT_PLATFORM
 from .h265_utils import detect_camera_encodings_from_bag, get_h265_topic
@@ -47,6 +47,15 @@ DEFAULT_SG100_JOINT_NAMES = [
     *[f"left_sg100_{i}" for i in range(1, 12)],
     *[f"right_sg100_{i}" for i in range(1, 12)],
 ]
+
+# ================ SG100 二值化（init_parameters 会按配置覆盖） ================
+# 22 维开合参考位姿 + 闭合判定比例。
+SG100_BINARY_OPEN: Tuple[float, ...] = ()
+SG100_BINARY_CLOSE: Tuple[float, ...] = ()
+SG100_BINARY_RATIO = 0.2
+# 每只手的判定关节（手内下标），由 dex_dof_offset 指定。
+SG100_BINARY_JOINTS: Tuple[Tuple[int, ...], Tuple[int, ...]] = ((), ())
+
 DEFAULT_LEJUCLAW_JOINT_NAMES = [
     "left_claw", "right_claw",
 ]
@@ -73,7 +82,8 @@ def init_parameters(cfg):
     global TASK_DESCRIPTION
     global DEX_DOF_NEEDED, DEX_DOF_OFFSET
     global PLATFORM_TYPE, USE_5W_WHOLEBODY, USE_5W_BASE_MOVE
-
+    global SG100_BINARY_OPEN, SG100_BINARY_CLOSE, SG100_BINARY_RATIO
+    global SG100_BINARY_JOINTS
     
     from .config_dataset import load_config
     config = load_config(cfg)
@@ -110,7 +120,15 @@ def init_parameters(cfg):
     USE_QIANGNAO = config.use_qiangnao  # 由eef_type决定
     USE_SG100 = config.use_sg100
 
+    # SG100 二值化参考位姿与判定比例（仅 sg100 的二值化路径读取）
+    SG100_BINARY_OPEN = tuple(config.sg100_binary_open)
+    SG100_BINARY_CLOSE = tuple(config.sg100_binary_close)
+    SG100_BINARY_RATIO = config.sg100_binary_ratio
+    # 每手只用 dex_dof_offset 指定的一个关节
+    SG100_BINARY_JOINTS = ((config.dex_dof_offset[0],), (config.dex_dof_offset[1],))
+
     TASK_DESCRIPTION = config.task_description  # 任务描述
+
 
 
 # ================ 数据处理函数定义 ==================

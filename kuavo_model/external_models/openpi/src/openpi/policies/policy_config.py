@@ -1,5 +1,7 @@
 import logging
 import os
+import dataclasses
+import json
 import pathlib
 from typing import Any
 
@@ -44,6 +46,15 @@ def create_trained_policy(
     """
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+    maximum = 0
+    for marker in (checkpoint_dir / "rtc_training.json", checkpoint_dir / "assets" / "rtc_training.json"):
+        if marker.is_file():
+            maximum = int(json.loads(marker.read_text())["rtc_training_max_delay"])
+            break
+    if hasattr(train_config.model, "rtc_training_max_delay"):
+        # A deployment template is not evidence that these weights saw RTC
+        # training. Only checkpoint metadata enables trained inference.
+        train_config = dataclasses.replace(train_config, model=dataclasses.replace(train_config.model, rtc_training_max_delay=maximum))
 
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
@@ -90,5 +101,12 @@ def create_trained_policy(
         sample_kwargs=sample_kwargs,
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
+        rtc_repack_transforms=repack_transforms.inputs,
+        rtc_transforms=[
+            transforms.InjectDefaultPrompt(default_prompt),
+            *data_config.data_transforms.inputs,
+            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *data_config.model_transforms.inputs,
+        ],
         pytorch_device=pytorch_device if is_pytorch else None,
     )
