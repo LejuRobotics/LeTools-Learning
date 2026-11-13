@@ -77,6 +77,9 @@ if __name__ == "__main__":
     config.model.tune_visual = ft_config.tune_visual
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
+    if not 0 <= ft_config.rtc_training_max_delay < config.model.action_horizon:
+        raise ValueError("rtc_training_max_delay must be in [0, action_horizon)")
+    config.model.rtc_training_max_delay = ft_config.rtc_training_max_delay
     config.model.state_dropout_prob = ft_config.state_dropout_prob
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params

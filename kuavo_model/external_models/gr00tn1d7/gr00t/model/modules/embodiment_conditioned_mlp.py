@@ -192,7 +192,7 @@ class MultiEmbodimentActionEncoder(nn.Module):
         """
         Args:
             actions: [B, T, action_dim] action tensor
-            timesteps: [B,] timesteps - a single scalar per batch item
+            timesteps: [B,] or [B,T] flow time (RTC clean-prefix conditioning)
             cat_ids: [B,] category/embodiment IDs
         Returns:
             [B, T, hidden_size] encoded action features
@@ -205,9 +205,11 @@ class MultiEmbodimentActionEncoder(nn.Module):
         if timesteps.dim() == 1 and timesteps.shape[0] == B:
             # shape (B,) => (B,T)
             timesteps = timesteps.unsqueeze(1).expand(-1, T)
+        elif timesteps.dim() == 2 and timesteps.shape == (B, T):
+            pass
         else:
             raise ValueError(
-                "Expected `timesteps` to have shape (B,) so we can replicate across T."
+                "Expected `timesteps` to have shape (B,) or (B,T)."
             )
 
         # 2) Standard action MLP step for shape => (B, T, w)

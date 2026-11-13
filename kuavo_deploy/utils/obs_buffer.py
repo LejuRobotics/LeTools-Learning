@@ -7,6 +7,7 @@ import cv2
 import rospy
 from tqdm import tqdm
 import time
+from threading import Lock
 import sys
 from kuavo_deploy.config import KuavoConfig
 from sensor_msgs.msg import CompressedImage, JointState
@@ -17,6 +18,7 @@ from kuavo_deploy.utils.logging_utils import setup_logger
 from kuavo_deploy.utils.ros_manager import ROSManager
 from kuavo_deploy.utils.h265_decoder import RealtimeH265Decoder
 from kuavo_data.common.config_platform import get_arm_joint_slice
+from kuavo_data.common.sg100 import sg100_binarize
 from kuavo_deploy.utils.sg100_msgs import SG100HandState
 
 log_robot = setup_logger("robot")
@@ -28,14 +30,35 @@ class ObsBuffer:
         config: KuavoConfig,  
         obs_key_map: Dict[str, Dict[str, Any]] = None,
         compute_func_map: Dict[str, Callable] = None,
+        *,
+        cache_full_arm: bool = False,
     ) -> None:
         self.control_signal_manager = ControlSignalManager()
         self.ros_manager = ROSManager()
         # === 从 KuavoConfig 中提取环境配置 ===
         # env_cfg = config.env
         env_cfg = config
+        self._cache_full_arm = cache_full_arm
+        self._full_arm_lock = Lock() if cache_full_arm else None
+        self._full_arm_sample = None
+        self._full_eef_sample = None
         self.which_arm = env_cfg.which_arm
         self.platform_type = env_cfg.platform_type
+
+        # === SG100 观测二值化（与数转共用 kuavo_data.common.sg100 的实现） ===
+        # 与数转 dataset.is_binary / sg100_binary_ratio 语义一致，判定关节由
+        # sg100_dof_offset 指定（dof=11 时无代表维，不做二值化）。
+        self.eef_type = getattr(env_cfg, "eef_type", None)
+        self.is_binary = getattr(env_cfg, "is_binary", False)
+        self.sg100_dof_needed = getattr(env_cfg, "sg100_dof_needed", 1)
+        self.sg100_dof_offset = getattr(env_cfg, "sg100_dof_offset", 0)
+        self.sg100_binary_ratio = getattr(env_cfg, "sg100_binary_ratio", 0.1)
+        self.sg100_open_pose = np.asarray(
+            getattr(env_cfg, "sg100_open_pose", []), dtype=np.float64
+        )
+        self.sg100_close_pose = np.asarray(
+            getattr(env_cfg, "sg100_close_pose", []), dtype=np.float64
+        )
 
         # === 观测定义 ===
         self.obs_key_map = obs_key_map or env_cfg.obs_key_map or {}
@@ -177,6 +200,10 @@ class ObsBuffer:
         arm_start, arm_end = get_arm_joint_slice(self.platform_type)
         arm_joints = joint[arm_start:arm_end]  # 提取双臂关节
 
+        if self._cache_full_arm:
+            with self._full_arm_lock:
+                self._full_arm_sample = (np.asarray(arm_joints, dtype=np.float64).copy(),
+                                         timestamp, time.monotonic())
         self.compute_dependent_obs(key, arm_joints, timestamp)
 
         slice_value = handle.get("params", {}).get("slice", None)  
@@ -187,6 +214,7 @@ class ObsBuffer:
     def lejuClawState_callback(self, msg: lejuClawState, key: str, handle = dict):
         # Float64Array ()
         joint = msg.data.position
+        self._store_full_eef(joint, msg.header.stamp.to_sec())
         slice_value = handle.get("params", {}).get("slice", None)  
         joint = [x / 100 for slc in slice_value for x in joint[slc[0]:slc[1]]] # 注意缩放
         # joint = torch.tensor(joint, dtype=torch.float32, device=self.device)
@@ -194,6 +222,7 @@ class ObsBuffer:
 
     def qiangnaoState_callback(self, msg: JointState, key: str, handle = dict):
         joint = msg.position
+        self._store_full_eef(joint, msg.header.stamp.to_sec())
         joint = [figure / 100 for figure in joint]
         slice_value = handle.get("params", {}).get("slice", None)
         joint = [x for slc in slice_value for x in joint[slc[0]:slc[1]]]
@@ -213,7 +242,21 @@ class ObsBuffer:
         if len(joint) != 22:
             log_robot.warning(f"Discarding SG100 state with {len(joint)} positions; expected 22")
             return
-        joint = [float(value) / 1.57 for value in joint]
+        # 先按数转的公式二值化 22 维原始值，再按 slice 取代表维（即 11*h+offset）。
+        if (
+            self.is_binary
+            and self.eef_type == "sg100"
+            and self.sg100_dof_needed == 1
+            and self.sg100_open_pose.size == len(joint)
+        ):
+            offset = self.sg100_dof_offset
+            joint = sg100_binarize(
+                np.asarray(joint, dtype=np.float64),
+                self.sg100_open_pose,
+                self.sg100_close_pose,
+                ((offset,), (offset,)),
+                self.sg100_binary_ratio,
+            ).tolist()
         slices = handle.get("params", {}).get("slice") or []
         joint = [value for start, end in slices for value in joint[start:end]]
         self._append_data(key, joint, msg.header.stamp.to_sec())
@@ -267,6 +310,47 @@ class ObsBuffer:
 
         log_robot.info("✅ All buffers ready!")
         return True
+
+    def _store_full_eef(self, positions, stamp):
+        if not self._cache_full_arm:
+            return
+        with self._full_arm_lock:
+            self._full_eef_sample = (np.asarray(positions, dtype=np.float64).copy(),
+                                     stamp, time.monotonic())
+
+    def full_eef_feedback(self, max_age):
+        if not self._cache_full_arm:
+            raise RuntimeError("Complete hand feedback is only enabled for single-arm DAgger")
+        with self._full_arm_lock:
+            sample = self._full_eef_sample
+        return self._fresh_full_sample(sample, max_age, feedback_name="hand")
+
+    def full_arm_feedback(self, max_age):
+        if not self._cache_full_arm:
+            raise RuntimeError("Complete arm feedback is only enabled for single-arm DAgger")
+        with self._full_arm_lock:
+            sample = self._full_arm_sample
+        return self._fresh_full_sample(sample, max_age, feedback_name="arm")
+
+    @staticmethod
+    def _fresh_full_sample(sample, max_age, feedback_name="arm/hand"):
+        if sample is None:
+            raise RuntimeError(f"No complete {feedback_name} feedback")
+        joints, stamp, received = sample
+        ros_age = rospy.Time.now().to_sec() - stamp
+        received_age = time.monotonic() - received
+        # Publisher and subscriber run on different hosts. Allow a bounded
+        # clock lead (observed 3-11 ms on RL/5W_98), while still requiring fresh
+        # local receipt and rejecting old or substantially future ROS stamps.
+        future_tolerance = min(0.05, max_age)
+        if (stamp <= 0 or not np.isfinite(ros_age)
+                or not -future_tolerance <= ros_age <= max_age
+                or not 0 <= received_age <= max_age):
+            raise RuntimeError(
+                f"Full {feedback_name} feedback is stale "
+                f"(ros_age={ros_age:.6f}s, received_age={received_age:.6f}s, "
+                f"max_age={max_age:.3f}s, future_tolerance={future_tolerance:.3f}s)")
+        return joints.copy()
 
     def get_latest_obs(self):
         obs = {}

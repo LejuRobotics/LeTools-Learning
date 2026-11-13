@@ -100,6 +100,8 @@ class PolicyPreprocessMixin:
         use_compile: bool = False,
         capture_time: bool = False,
         sample_compile_fn: callable = None,
+        rtc_prefix=None,
+        rtc_options=None,
     ) -> Tensor:
         """Run one model forward for a batch of already-transformed observations.
 
@@ -169,6 +171,7 @@ class PolicyPreprocessMixin:
                             lang_masks.to(device=device),
                             state.to(dtype=dtype, device=device),
                             image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
+                            **({"rtc_prefix": rtc_prefix, "rtc_options": rtc_options} if rtc_options is not None else {}),
             )
 
         delta_time = time.time() - s1
@@ -379,7 +382,9 @@ class LingbotVLAv2Server:
         outputs = []
         for transformed, action in zip(transformed_observations, actions):
             single = dict(transformed)
-            single['actions'] = action.to(dtype=torch.float32, device='cpu')
+            # Inverse relative transforms may update views in place. Preserve
+            # the normalized sequence for RTC's model-space queue.
+            single['actions'] = action.detach().to(dtype=torch.float32, device='cpu').clone()
             if self.use_bf16 and 'state' in single:
                 single['state'] = single['state'].to(dtype=torch.float32)
             data = self.vla.feature_transform.unapply(single)
@@ -527,6 +532,45 @@ class LingbotVLAv2Server:
         self.global_step += 1
         
         return result
+
+    def decode_rtc_prefix(self, original, context=None):
+        previous = getattr(self, "_rtc_previous_applied", None) if context is None else {
+            key: torch.as_tensor(value) for key, value in context.items()
+        }
+        if previous is None:
+            raise ValueError("RTC prefix has no previous LingBot observation anchor")
+        return self._unapply_batched_actions([previous], torch.as_tensor(original)[None])
+
+    def infer_rtc(self, observation, *, rtc_options, absolute_prefix=None):
+        raw = dict(observation)
+        self.resize_image(raw)
+        raw = {key: torch.from_numpy(value.copy()) if isinstance(value, np.ndarray) else value for key, value in raw.items()}
+        transformed = self.vla.feature_transform.apply(dict(raw), policy_eval=True)
+        batch = {key: value.unsqueeze(0) if isinstance(value, torch.Tensor) else [value] for key, value in transformed.items()}
+        prefix = None
+        if absolute_prefix is not None:
+            groups = {}
+            for key, value in absolute_prefix.items():
+                value = np.asarray(value)[0]
+                if len(value) < self.config.chunk_size:
+                    value = np.concatenate([value, np.repeat(value[-1:], self.config.chunk_size - len(value), axis=0)])
+                groups[key] = value[:self.config.chunk_size]
+            prefix = self.vla.feature_transform.encode_rtc_prefix(raw, groups)[None].to(
+                device="cuda", dtype=torch.bfloat16 if self.use_bf16 else torch.float32)
+        t = time.perf_counter()
+        with torch.inference_mode(False):
+            original = self.vla.sample_actions_batch(
+                batch, self.use_bf16, False, sample_compile_fn=self.vla.model.sample_actions,
+                rtc_prefix=prefix, rtc_options=rtc_options,
+            )
+        torch.cuda.synchronize()
+        print(f"[RTC-TIMING] sample_actions_batch {time.perf_counter() - t:.3f}s prefix={'none' if prefix is None else tuple(prefix.shape)}", flush=True)
+        t = time.perf_counter()
+        processed = self._unapply_batched_actions([transformed], original)
+        print(f"[RTC-TIMING] unapply {time.perf_counter() - t:.3f}s", flush=True)
+        self._rtc_previous_applied = transformed
+        context = {key: transformed[key].detach().cpu().clone() for key in ("state", "state_joint_mask", "action_joint_mask")}
+        return processed, original[0].numpy(), context
 
 def str2bool(v):
     if isinstance(v, bool):

@@ -6,8 +6,10 @@ import csv
 import datetime as _dt
 import json
 import math
+import random
 import sys
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -44,16 +46,21 @@ def _setup_policy(
     policy_type: str,
     device,
     task_prompt: str,
+    async_inference: bool = False,
 ):
-    from kuavo_deploy.kuavo_service.client import PolicyClient
-    from kuavo_deploy.utils.policy_loader import load_native_policy_bundle
-
     if device.type == "cpu":
         log_model.warning("Using CPU for offline inference; this may be slow.")
 
     if policy_type == "client":
         preprocessor, postprocessor = lambda obs: obs, lambda action: action
+        if async_inference:
+            # Construct the unchanged client in the inference worker.
+            return None, preprocessor, postprocessor, None
+        from kuavo_deploy.kuavo_service.client import PolicyClient
+
         return PolicyClient(task_prompt=task_prompt), preprocessor, postprocessor, None
+
+    from kuavo_deploy.utils.policy_loader import load_native_policy_bundle
 
     policy, preprocessor, postprocessor, pretrained_model_dir = load_native_policy_bundle(
         pretrained_path=pretrained_path,
@@ -83,6 +90,11 @@ def _patch_data_config_from_deploy(data_cfg, config: KuavoConfig):
     )
     data_cfg.dataset.dex_dof_offset = env.sg100_dof_offset if env.eef_type == "sg100" else 0
     data_cfg.dataset.is_binary = env.is_binary
+    if env.eef_type == "sg100":
+        # Offline parsing must use the same calibration as live observations.
+        data_cfg.dataset.sg100_binary_open = list(env.sg100_open_pose)
+        data_cfg.dataset.sg100_binary_close = list(env.sg100_close_pose)
+        data_cfg.dataset.sg100_binary_ratio = env.sg100_binary_ratio
     data_cfg.dataset.train_hz = env.ros_rate
     data_cfg.dataset.task_description = inf.task_prompt or "robot manipulation"
 
@@ -219,8 +231,17 @@ def _load_bag_frames(
         claw_action = _normalize_binary_or_range(claw_action, binary_threshold=50, scale=100)
         qiangnao_state = _normalize_binary_or_range(qiangnao_state, binary_threshold=50, scale=100)
         qiangnao_action = _normalize_binary_or_range(qiangnao_action, binary_threshold=50, scale=100)
-        sg100_state = _normalize_binary_or_range(sg100_state, binary_threshold=0.785, scale=1.57)
-        sg100_action = _normalize_binary_or_range(sg100_action, binary_threshold=0.785, scale=1.57)
+        if kuavo.USE_SG100 and kuavo.IS_BINARY:
+            from kuavo_data.common.sg100 import sg100_binarize
+
+            def binary_sg100(values):
+                return sg100_binarize(
+                    values, kuavo.SG100_BINARY_OPEN, kuavo.SG100_BINARY_CLOSE,
+                    kuavo.SG100_BINARY_JOINTS, kuavo.SG100_BINARY_RATIO,
+                ).astype(np.float32)
+
+            sg100_state, sg100_action = binary_sg100(sg100_state), binary_sg100(sg100_action)
+        # Non-binary SG100 features are physical joint angles, as in conversion/live feedback.
         rq2f85_state = _normalize_binary_or_range(rq2f85_state, binary_threshold=0.4, scale=0.8)
         rq2f85_action = _normalize_binary_or_range(rq2f85_action, binary_threshold=70, scale=255)
 
@@ -298,12 +319,52 @@ def _load_bag_frames(
 
         frames.append(frame)
 
-    bag_reader.process_rosbag_chunked(
-        bag_file=str(bag_path),
-        frame_callback=on_frame,
-        chunk_size=chunk_size,
-        save_callback=lambda: None,
-    )
+    with ExitStack() as stack:
+        frame_callback = on_frame
+        if config.env.camera_encoding == "h265":
+            import rosbag
+            from kuavo_deploy.utils.h265_decoder import RealtimeH265Decoder
+
+            # Use the same topics and decoder as live camera observations.
+            topic_to_camera = {}
+            decoders = {}
+            for cam in kuavo.DEFAULT_CAMERA_NAMES:
+                topic = config.env._H265_TOPIC_MAP.get(cam)
+                if topic is not None:
+                    bag_reader._topic_process_map[cam]["topic"] = topic
+                    bag_reader._h265_cameras.add(cam)
+                    topic_to_camera[topic] = cam
+                    decoders[cam] = RealtimeH265Decoder(kuavo.RESIZE_W, kuavo.RESIZE_H)
+
+            # Read continuously from the start so chunking and sample_drop do
+            # not skip reference frames or decode overlapping ranges twice.
+            camera_bag = stack.enter_context(rosbag.Bag(str(bag_path)))
+            messages = iter(camera_bag.read_messages(topics=list(topic_to_camera)))
+            pending = next(messages, None)
+            latest_images = {}
+
+            def on_h265_frame(aligned_frame: dict[str, Any], frame_idx: int) -> None:
+                nonlocal pending
+                if max_frames is not None and len(frames) >= max_frames:
+                    return
+                while pending is not None and pending[2].to_sec() <= aligned_frame["timestamp"]:
+                    topic, msg, stamp = pending
+                    cam = topic_to_camera[topic]
+                    rgb = decoders[cam].decode(bytes(msg.data))
+                    if rgb is not None:
+                        latest_images[cam] = {"data": rgb, "timestamp": stamp.to_sec()}
+                    pending = next(messages, None)
+                aligned_frame.update(latest_images)
+                on_frame(aligned_frame, frame_idx)
+
+            frame_callback = on_h265_frame
+
+        bag_reader.process_rosbag_chunked(
+            bag_file=str(bag_path),
+            frame_callback=frame_callback,
+            chunk_size=chunk_size,
+            save_callback=lambda: None,
+        )
     return frames
 
 
@@ -368,261 +429,6 @@ def _infer_one_action(policy, preprocessor, postprocessor, observation: dict[str
     action = postprocessor(action)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     return _action_to_numpy(action), elapsed_ms
-
-
-def _to_chunk_tensor(actions: Any):
-    import torch
-
-    if isinstance(actions, torch.Tensor):
-        tensor = actions
-    elif isinstance(actions, np.ndarray):
-        tensor = torch.from_numpy(actions)
-    else:
-        tensor = torch.as_tensor(actions)
-
-    if tensor.ndim == 3 and tensor.shape[0] == 1:
-        tensor = tensor.squeeze(0)
-    if tensor.ndim == 1:
-        tensor = tensor.unsqueeze(0)
-    if tensor.ndim != 2:
-        raise ValueError(f"Expected action chunk shape [T, D], got {tuple(tensor.shape)}")
-    return tensor
-
-
-def _select_action_chunk(policy, observation: dict[str, Any]) -> Any:
-    if hasattr(policy, "select_action_chunk"):
-        return policy.select_action_chunk(observation)
-    if hasattr(policy, "predict_action_chunk"):
-        return policy.predict_action_chunk(observation)
-    return policy.select_action(observation)
-
-
-def _postprocess_chunk(actions: Any, postprocessor) -> list[np.ndarray]:
-    chunk = _to_chunk_tensor(actions)
-    out: list[np.ndarray] = []
-    for idx in range(chunk.shape[0]):
-        processed = postprocessor(chunk[idx : idx + 1])
-        processed = _to_chunk_tensor(processed)
-        out.append(processed[0].detach().cpu().numpy().reshape(-1).astype(np.float64))
-    return out
-
-
-def _infer_action_chunk(
-    policy,
-    preprocessor,
-    postprocessor,
-    observation: dict[str, Any],
-) -> tuple[list[np.ndarray], float]:
-    import torch
-
-    start = time.perf_counter()
-    observation = preprocessor(observation)
-    with torch.inference_mode():
-        actions = _select_action_chunk(policy, observation)
-    actions_np = _postprocess_chunk(actions, postprocessor)
-    elapsed_ms = (time.perf_counter() - start) * 1000.0
-    return actions_np, elapsed_ms
-
-
-def _infer_action_chunk_rtc(
-    policy,
-    preprocessor,
-    observation: dict[str, Any],
-    *,
-    prev_chunk_leftover: np.ndarray | None,
-    inference_delay: int,
-    execution_horizon: int,
-    rtc_options: dict[str, Any],
-) -> tuple[list[np.ndarray], np.ndarray, float]:
-    start = time.perf_counter()
-    observation = preprocessor(observation)
-    if not hasattr(policy, "select_action_chunk_rtc"):
-        raise RuntimeError(
-            f"rtc_full_enabled=true but policy {type(policy).__name__} "
-            "does not implement select_action_chunk_rtc()"
-        )
-    result = policy.select_action_chunk_rtc(
-        observation,
-        prev_chunk_leftover=prev_chunk_leftover,
-        inference_delay=inference_delay,
-        execution_horizon=execution_horizon,
-        rtc_options=rtc_options,
-    )
-    if not isinstance(result, dict) or not {"processed_actions", "original_actions"} <= result.keys():
-        raise ValueError("RTC policy result must contain processed_actions and original_actions")
-    processed = _to_chunk_tensor(result["processed_actions"]).detach().cpu().numpy()
-    original = _to_chunk_tensor(result["original_actions"]).detach().cpu().numpy()
-    if processed.shape[0] != original.shape[0]:
-        raise ValueError("RTC processed/original chunks must contain the same number of steps")
-    elapsed_ms = (time.perf_counter() - start) * 1000.0
-    return [np.asarray(action, dtype=np.float64) for action in processed], original, elapsed_ms
-
-
-def _ramp_weights(blend_count: int, ramp: str) -> np.ndarray:
-    if blend_count <= 0:
-        return np.zeros((0,), dtype=np.float64)
-    if blend_count == 1:
-        return np.ones((1,), dtype=np.float64)
-    idx = np.arange(1, blend_count + 1, dtype=np.float64)
-    if ramp == "linear":
-        return idx / blend_count
-    if ramp == "cosine":
-        return 0.5 - 0.5 * np.cos(math.pi * idx / blend_count)
-    raise ValueError(f"Unsupported ramp '{ramp}'. Valid: linear, cosine")
-
-
-class OfflineActionBuffer:
-    def __init__(self, maxlen: int):
-        self.maxlen = max(1, int(maxlen))
-        self._actions: list[np.ndarray] = []
-        self._total_popped = 0
-
-    def qsize(self) -> int:
-        return len(self._actions)
-
-    def get_action_index(self) -> int:
-        return self._total_popped
-
-    def put_chunk(self, actions: list[np.ndarray]) -> dict[str, Any]:
-        free = self.maxlen - len(self._actions)
-        inserted_actions = actions[: max(0, free)]
-        self._actions.extend(np.asarray(a).copy() for a in inserted_actions)
-        return {
-            "mode": "append",
-            "produced": len(actions),
-            "inserted": len(inserted_actions),
-            "queued": len(self._actions),
-        }
-
-    def merge_chunk(
-        self,
-        actions: list[np.ndarray],
-        *,
-        delay_steps: int,
-        overlap_steps: int,
-        freeze_steps: int,
-        keep_min_actions: int,
-        ramp: str,
-    ) -> dict[str, Any]:
-        overlap_steps = max(0, int(overlap_steps))
-        freeze_steps = max(0, int(freeze_steps))
-        keep_min_actions = max(0, int(keep_min_actions))
-        delay_steps = max(0, int(delay_steps))
-
-        old = list(self._actions)
-        old_size = len(old)
-        new_len = len(actions)
-        delay = min(delay_steps, new_len)
-        new_valid = list(actions[delay:])
-
-        if not new_valid:
-            return {
-                "mode": "blend_replace",
-                "old_size": old_size,
-                "produced": new_len,
-                "delay_steps": delay,
-                "kept": old_size,
-                "blended": 0,
-                "queued": old_size,
-                "dropped_new_prefix": delay,
-            }
-
-        old_keep_count = min(old_size, max(freeze_steps, keep_min_actions))
-        kept = old[:old_keep_count]
-        old_blend = old[old_keep_count : old_keep_count + overlap_steps]
-        new_blend = new_valid[:overlap_steps]
-        blend_count = min(len(old_blend), len(new_blend))
-
-        blended: list[np.ndarray] = []
-        if blend_count > 0:
-            weights = _ramp_weights(blend_count, ramp)
-            for i, w in enumerate(weights):
-                a_old = np.asarray(old_blend[i], dtype=np.float64)
-                a_new = np.asarray(new_blend[i], dtype=np.float64)
-                blended.append((1.0 - float(w)) * a_old + float(w) * a_new)
-
-        tail = new_valid[blend_count:]
-        self._actions = (kept + blended + tail)[: self.maxlen]
-        return {
-            "mode": "blend_replace",
-            "old_size": old_size,
-            "produced": new_len,
-            "delay_steps": delay,
-            "kept": len(kept),
-            "blended": len(blended),
-            "queued": len(self._actions),
-            "dropped_new_prefix": delay,
-        }
-
-    def get(self) -> np.ndarray | None:
-        if not self._actions:
-            return None
-        action = self._actions.pop(0)
-        self._total_popped += 1
-        return action
-
-
-class OfflineRtcActionBuffer(OfflineActionBuffer):
-    def __init__(self, maxlen: int):
-        super().__init__(maxlen)
-        self._original_actions: list[np.ndarray] = []
-
-    def snapshot_original_actions(self) -> np.ndarray | None:
-        if not self._original_actions:
-            return None
-        return np.stack([np.asarray(action).copy() for action in self._original_actions], axis=0)
-
-    def replace_after_delay(
-        self,
-        actions: list[np.ndarray],
-        original_actions: np.ndarray,
-        *,
-        delay_steps: int,
-    ) -> dict[str, Any]:
-        original = np.asarray(original_actions)
-        if len(actions) != original.shape[0]:
-            raise ValueError("RTC processed/original chunks must contain the same number of steps")
-        old_size = len(self._actions)
-        delay = min(max(0, int(delay_steps)), len(actions))
-        remaining = actions[delay:]
-        if len(remaining) > self.maxlen:
-            raise ValueError(
-                "RTC Full must preserve the model's remaining native chunk; "
-                f"async_buffer_size={self.maxlen} is smaller than remaining chunk={len(remaining)}"
-            )
-        self._actions = [np.asarray(action).copy() for action in remaining]
-        self._original_actions = [np.asarray(action).copy() for action in original[delay:]]
-        return {
-            "mode": "rtc_full_replace",
-            "old_size": old_size,
-            "produced": len(actions),
-            "delay_steps": delay,
-            "queued": len(self._actions),
-        }
-
-    def get(self) -> np.ndarray | None:
-        action = super().get()
-        if action is not None:
-            if not self._original_actions:
-                raise RuntimeError("RTC full offline queues are no longer aligned")
-            self._original_actions.pop(0)
-        return action
-
-
-def _resolve_offline_control_hz(config: KuavoConfig) -> float:
-    cfg = config.inference
-    if cfg.async_control_hz and cfg.async_control_hz > 0:
-        return float(cfg.async_control_hz)
-    if config.env.ros_rate and config.env.ros_rate > 0:
-        return float(config.env.ros_rate)
-    return 10.0
-
-
-def _chunk_delay_steps(infer_ms: float, control_hz: float, max_delay_steps: int | None = None) -> int:
-    delay = max(0, int(math.ceil((infer_ms / 1000.0) * control_hz)))
-    if max_delay_steps is not None:
-        delay = min(delay, max(0, int(max_delay_steps)))
-    return delay
 
 
 def _write_csv(path: Path, predictions: np.ndarray, targets: np.ndarray, errors: np.ndarray) -> None:
@@ -699,14 +505,14 @@ def _prepare_observation_for_policy(
     policy_type: str,
     task_prompt: str,
 ) -> dict[str, Any]:
-    from kuavo_deploy.utils.policy_loader import inject_task_prompt
-
     observation = _frame_to_policy_observation(
         frame,
         device=device,
         native_policy=policy_type != "client",
     )
     if policy_type != "client":
+        from kuavo_deploy.utils.policy_loader import inject_task_prompt
+
         observation = inject_task_prompt(observation, task_prompt)
     return observation
 
@@ -722,7 +528,7 @@ def _run_sync_offline(
     policy_type: str,
     task_prompt: str,
     log_step_times: bool,
-) -> tuple[np.ndarray, np.ndarray, list[float], list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[np.ndarray, np.ndarray, list[float]]:
     predictions: list[np.ndarray] = []
     targets: list[np.ndarray] = []
     infer_times_ms: list[float] = []
@@ -747,187 +553,93 @@ def _run_sync_offline(
         if log_step_times:
             print(f"[offline-sync] step={step} select_action_ms={infer_ms:.3f}", flush=True)
 
-    return np.stack(predictions, axis=0), np.stack(targets, axis=0), infer_times_ms, [], {}
+    return np.stack(predictions, axis=0), np.stack(targets, axis=0), infer_times_ms
+
+
+def _replay_offsets(frames, control_hz, replay_speed):
+    """Use bag frame spacing, falling back to the configured action frequency."""
+    if not math.isfinite(replay_speed) or replay_speed <= 0:
+        raise ValueError("replay_speed must be finite and positive")
+    if not math.isfinite(control_hz) or control_hz <= 0:
+        raise ValueError("env.ros_rate must be finite and positive for offline async inference")
+    try:
+        timestamps = np.asarray([float(frame["timestamp"]) for frame in frames], dtype=np.float64)
+    except (KeyError, TypeError, ValueError):
+        timestamps = np.full(len(frames), np.nan)
+    if np.all(np.isfinite(timestamps)) and np.all(np.diff(timestamps) > 0):
+        return (timestamps - timestamps[0]) / replay_speed, "bag_timestamps"
+    log_model.warning("Bag timestamps missing or invalid; pacing offline async at env.ros_rate")
+    return np.arange(len(frames), dtype=np.float64) / (control_hz * replay_speed), "env.ros_rate"
 
 
 def _run_async_offline(
-    *,
-    config: KuavoConfig,
-    frames: list[dict[str, Any]],
-    total: int,
-    policy,
-    preprocessor,
-    postprocessor,
-    device,
-    policy_type: str,
-    task_prompt: str,
-    log_step_times: bool,
-) -> tuple[np.ndarray, np.ndarray, list[float], list[dict[str, Any]], dict[str, Any]]:
-    cfg = config.inference
-    rtc_full_enabled = bool(getattr(cfg, "rtc_full_enabled", False))
-    buffer = (
-        OfflineRtcActionBuffer(maxlen=cfg.async_buffer_size)
-        if rtc_full_enabled
-        else OfflineActionBuffer(maxlen=cfg.async_buffer_size)
-    )
-    control_hz = _resolve_offline_control_hz(config)
-    low_watermark = max(0, int(cfg.async_low_watermark))
-    rtc_lite_enabled = bool(getattr(cfg, "rtc_lite_enabled", False))
-    rtc_options = {
-        "enabled": True,
-        "mode": str(cfg.rtc_full_mode),
-        "prefix_attention_schedule": str(cfg.rtc_full_prefix_attention_schedule),
-        "max_guidance_weight": float(cfg.rtc_full_max_guidance_weight),
-        # RTC continuity target length plus inpainting ramp controls.
-        "overlap_steps": int(cfg.rtc_full_overlap_steps),
-        "frozen_steps": int(cfg.rtc_full_frozen_steps),
-        "ramp_rate": float(cfg.rtc_full_ramp_rate),
-        "debug": bool(cfg.rtc_full_debug),
-    }
+    *, frames, total, policy, preprocessor, postprocessor, device, config,
+    log_step_times, replay_speed=1.0,
+):
+    from kuavo_deploy.utils.async_inference import AsyncInference
 
-    predictions: list[np.ndarray] = []
-    targets: list[np.ndarray] = []
-    infer_times_ms: list[float] = []
-    events: list[dict[str, Any]] = []
-    pending: dict[str, Any] | None = None
-    last_action: np.ndarray | None = None
-    estimated_delay_steps = 0
-
-    def start_inference(step: int, *, warmup: bool = False) -> dict[str, Any]:
-        observation = _prepare_observation_for_policy(
-            frame=frames[step],
-            device=device,
-            policy_type=policy_type,
-            task_prompt=task_prompt,
-        )
-        action_index_before = buffer.get_action_index()
-        if rtc_full_enabled:
-            actions, original_actions, infer_ms = _infer_action_chunk_rtc(
-                policy,
-                preprocessor,
-                observation,
-                prev_chunk_leftover=buffer.snapshot_original_actions(),
-                inference_delay=estimated_delay_steps,
-                execution_horizon=int(cfg.rtc_full_overlap_steps),
-                rtc_options=rtc_options,
+    selected = frames[:total]
+    offsets, pacing_source = _replay_offsets(selected, config.env.ros_rate, replay_speed)
+    # A faster replay consumes more model actions per wall-clock second. RTC's
+    # latency estimate must use that cadence rather than the nominal ROS rate.
+    effective_hz = 1.0 / float(np.median(np.diff(offsets))) if len(offsets) > 1 else config.env.ros_rate * replay_speed
+    predictions, targets, wait_times_ms, timeline = [], [], [], []
+    next_deadline = None
+    first_action_time = None
+    wall_start = time.monotonic()
+    with AsyncInference(policy, preprocessor, postprocessor, config.inference, record_chunks=True, control_hz=effective_hz) as runner:
+        for step, frame in enumerate(tqdm(selected, desc="Offline async inference", unit="step")):
+            if next_deadline is not None:
+                remaining = next_deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(remaining)
+            observation = _prepare_observation_for_policy(
+                frame=frame, device=device, policy_type=config.inference.policy_type,
+                task_prompt=config.inference.task_prompt,
             )
-        else:
-            actions, infer_ms = _infer_action_chunk(policy, preprocessor, postprocessor, observation)
-            original_actions = None
-        if log_step_times:
-            print(
-                f"[offline-async] request_step={step} chunk_infer_ms={infer_ms:.3f} "
-                f"produced={len(actions)} warmup={warmup}",
-                flush=True,
-            )
-        max_delay = (
-            int(cfg.rtc_full_max_delay_steps)
-            if rtc_full_enabled
-            else int(cfg.rtc_lite_max_delay_steps) if rtc_lite_enabled else None
-        )
-        measured_delay = _chunk_delay_steps(infer_ms, control_hz, max_delay)
-        # During warmup the real control loop has not started yet, so the
-        # completed chunk is available before step 0 consumes anything.
-        ready_delay = 0 if warmup else measured_delay
-        return {
-            "request_step": step,
-            "ready_step": step + ready_delay,
-            "actions": actions,
-            "original_actions": original_actions,
-            "infer_ms": infer_ms,
-            "measured_delay": measured_delay,
-            "action_index_before": action_index_before,
-            "warmup": warmup,
-        }
-
-    def apply_pending(done: dict[str, Any], step: int) -> None:
-        nonlocal estimated_delay_steps
-        actual_consumed = max(0, buffer.get_action_index() - int(done["action_index_before"]))
-        if rtc_full_enabled:
-            delay_steps = 0 if done["warmup"] else max(actual_consumed, int(done["measured_delay"]))
-            delay_steps = min(delay_steps, int(cfg.rtc_full_max_delay_steps))
-            stats = buffer.replace_after_delay(
-                done["actions"],
-                done["original_actions"],
-                delay_steps=delay_steps,
-            )
-            estimated_delay_steps = delay_steps
-        elif rtc_lite_enabled:
-            delay_steps = 0 if done["warmup"] else max(actual_consumed, int(done["measured_delay"]))
-            delay_steps = min(delay_steps, int(cfg.rtc_lite_max_delay_steps))
-            stats = buffer.merge_chunk(
-                done["actions"],
-                delay_steps=delay_steps,
-                overlap_steps=int(cfg.rtc_lite_overlap_steps),
-                freeze_steps=int(cfg.rtc_lite_freeze_steps),
-                keep_min_actions=int(cfg.rtc_lite_keep_min_actions),
-                ramp=str(cfg.rtc_lite_ramp),
-            )
-        else:
-            stats = buffer.put_chunk(done["actions"])
-            delay_steps = int(done["measured_delay"])
-
-        events.append(
-            {
-                "request_step": done["request_step"],
-                "ready_step": done["ready_step"],
-                "apply_step": step,
-                "infer_ms": done["infer_ms"],
-                "measured_delay": done["measured_delay"],
-                "actual_consumed": actual_consumed,
-                "delay_steps": delay_steps,
-                "rtc_lite_enabled": rtc_lite_enabled,
-                "rtc_full_enabled": rtc_full_enabled,
-                **stats,
-            }
-        )
-        infer_times_ms.append(float(done["infer_ms"]))
-
-    # Real async rollout waits for warmup actions before control starts.
-    pending = start_inference(0, warmup=True)
-    apply_pending(pending, 0)
-    pending = None
-
-    for step in tqdm(range(total), desc="Offline async inference", unit="step"):
-        if pending is not None and pending["ready_step"] <= step:
-            apply_pending(pending, step)
-            pending = None
-
-        if pending is None and buffer.qsize() <= low_watermark:
-            pending = start_inference(step, warmup=False)
-            if pending["ready_step"] <= step:
-                apply_pending(pending, step)
-                pending = None
-
-        action_get_start = time.perf_counter()
-        action = buffer.get()
-        action_get_ms = (time.perf_counter() - action_get_start) * 1000.0
-        if log_step_times:
-            print(
-                f"[offline-async] step={step} action_get_ms={action_get_ms:.6f} "
-                f"buffer_after_get={buffer.qsize()}",
-                flush=True,
-            )
-        if action is None:
-            if last_action is None:
-                raise RuntimeError(
-                    f"Offline async buffer is empty at step {step} before any action was available. "
-                    "Increase async_warmup_actions/async_low_watermark or inspect model chunk output."
+            start = time.perf_counter()
+            action = runner.select_action(observation)
+            wait_ms = (time.perf_counter() - start) * 1000.0
+            action_time = time.monotonic()
+            if first_action_time is None:
+                first_action_time = action_time
+            pred, target = _action_to_numpy(action), _action_to_numpy(frame["action"])
+            if pred.shape != target.shape:
+                raise ValueError(
+                    f"Predicted action shape {pred.shape} does not match bag action shape {target.shape}. "
+                    "Check deploy env.which_arm/eef_type and data conversion config."
                 )
-            action = last_action.copy()
-            events.append({"step": step, "event": "hold_last_action", "action_get_ms": action_get_ms})
-
-        target = _action_to_numpy(frames[step]["action"])
-        if action.shape != target.shape:
-            raise ValueError(
-                f"Predicted action shape {action.shape} does not match bag action shape {target.shape}. "
-                "Check deploy env.which_arm/eef_type and data conversion config."
-            )
-        predictions.append(np.asarray(action, dtype=np.float64))
-        targets.append(target)
-        last_action = np.asarray(action, dtype=np.float64)
-
-    return np.stack(predictions, axis=0), np.stack(targets, axis=0), infer_times_ms, events, {}
+            predictions.append(pred)
+            targets.append(target)
+            wait_times_ms.append(wait_ms)
+            elapsed = action_time - first_action_time
+            row = {
+                "step": step,
+                "frame_index": int(frame.get("frame_index", step)),
+                "replay_time_s": float(offsets[step]),
+                "elapsed_s": elapsed,
+                "drift_ms": (elapsed - float(offsets[step])) * 1000.0,
+                "select_action_ms": wait_ms,
+                "queue_after_pop": runner.queue_size,
+            }
+            timeline.append(row)
+            if log_step_times:
+                print(
+                    f"[offline-async] step={step} select_action_ms={wait_ms:.3f} "
+                    f"queue={row['queue_after_pop']} drift_ms={row['drift_ms']:.3f}", flush=True,
+                )
+            if step + 1 < len(selected):
+                # Hold each consumed action for one frame interval. If inference
+                # stalls, delay the replay instead of skipping frames or catching
+                # up with a burst of actions; this matches the logical step queue.
+                next_deadline = action_time + float(offsets[step + 1] - offsets[step])
+    return np.stack(predictions), np.stack(targets), wait_times_ms, {
+        "timeline": timeline,
+        "chunks": runner.chunk_history,
+        "pacing_source": pacing_source,
+        "effective_control_hz": effective_hz,
+        "wall_duration_s": time.monotonic() - wall_start,
+    }
 
 
 def run_offline_bag_eval(
@@ -938,23 +650,37 @@ def run_offline_bag_eval(
     output_dir: Path | None,
     max_frames: int | None,
     chunk_size: int,
-    mode: str,
     plot: bool,
     plot_dims: list[int] | None,
     log_step_times: bool,
+    replay_speed: float = 1.0,
 ) -> Path:
     import torch
-    from lerobot.utils.random_utils import set_seed
-    from lerobot_patches import custom_patches  # noqa: F401  Ensure LeRobot patches are installed.
-    from kuavo_deploy.utils.policy_loader import resolve_eval_output_dir
 
     cfg = config.inference
+    cfg.validate()
+    if max_frames is not None and max_frames <= 0:
+        raise ValueError("max_frames must be positive")
+    if cfg.max_episode_steps <= 0:
+        raise ValueError("max_episode_steps must be positive")
+    if not math.isfinite(replay_speed) or replay_speed <= 0:
+        raise ValueError("replay_speed must be finite and positive")
     pretrained_path = _resolve_pretrained_path(cfg)
-    eval_root = output_dir or resolve_eval_output_dir(pretrained_path, Path("outputs/offline_eval"))
-    run_dir = eval_root / f"{bag_path.stem}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if cfg.policy_type == "client":
+        eval_root = output_dir or Path("outputs/offline_eval/client")
+        random.seed(cfg.seed)
+        np.random.seed(cfg.seed)
+        torch.manual_seed(cfg.seed)
+    else:
+        from lerobot.utils.random_utils import set_seed
+        from lerobot_patches import custom_patches  # noqa: F401
+        from kuavo_deploy.utils.policy_loader import resolve_eval_output_dir
+
+        eval_root = output_dir or resolve_eval_output_dir(pretrained_path, Path("outputs/offline_eval"))
+        set_seed(seed=cfg.seed)
+    run_dir = eval_root / f"{bag_path.stem}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    set_seed(seed=cfg.seed)
     device = torch.device(cfg.device)
     task_prompt = getattr(cfg, "task_prompt", "robot manipulation")
     policy, preprocessor, postprocessor, pretrained_model_dir = _setup_policy(
@@ -962,6 +688,7 @@ def run_offline_bag_eval(
         policy_type=cfg.policy_type,
         device=device,
         task_prompt=task_prompt,
+        async_inference=cfg.async_inference,
     )
 
     frames = _load_bag_frames(
@@ -974,36 +701,23 @@ def run_offline_bag_eval(
     if not frames:
         raise RuntimeError(f"No valid frames loaded from bag: {bag_path}")
 
-    policy.reset()
     total = min(len(frames), cfg.max_episode_steps)
     if max_frames is not None:
         total = min(total, max_frames)
 
-    resolved_mode = "async" if mode == "auto" and cfg.async_inference else "sync" if mode == "auto" else mode
-    if resolved_mode == "async":
-        pred_arr, target_arr, infer_times_ms, events, timing = _run_async_offline(
-            config=config,
-            frames=frames,
-            total=total,
-            policy=policy,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            device=device,
-            policy_type=cfg.policy_type,
-            task_prompt=task_prompt,
-            log_step_times=log_step_times,
+    replay = None
+    if cfg.async_inference:
+        pred_arr, target_arr, infer_times_ms, replay = _run_async_offline(
+            frames=frames, total=total, policy=policy, preprocessor=preprocessor,
+            postprocessor=postprocessor, device=device, config=config,
+            log_step_times=log_step_times, replay_speed=replay_speed,
         )
     else:
-        pred_arr, target_arr, infer_times_ms, events, timing = _run_sync_offline(
-            frames=frames,
-            total=total,
-            policy=policy,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            device=device,
-            policy_type=cfg.policy_type,
-            task_prompt=task_prompt,
-            log_step_times=log_step_times,
+        policy.reset()
+        pred_arr, target_arr, infer_times_ms = _run_sync_offline(
+            frames=frames, total=total, policy=policy, preprocessor=preprocessor,
+            postprocessor=postprocessor, device=device, policy_type=cfg.policy_type,
+            task_prompt=task_prompt, log_step_times=log_step_times,
         )
 
     err_arr = pred_arr - target_arr
@@ -1015,10 +729,9 @@ def run_offline_bag_eval(
         "config_path": None,
         "data_config_path": str(data_config_path),
         "pretrained_model_dir": str(pretrained_model_dir or pretrained_path),
-        "mode": resolved_mode,
-        "async_inference": bool(cfg.async_inference),
-        "rtc_lite_enabled": bool(getattr(cfg, "rtc_lite_enabled", False)),
-        "rtc_full_enabled": bool(getattr(cfg, "rtc_full_enabled", False)),
+        "mode": "async" if cfg.async_inference else "sync",
+        "rtc_enabled": cfg.rtc_enabled,
+        "rtc_mode": cfg.rtc_mode if cfg.rtc_enabled else None,
         "num_steps": int(pred_arr.shape[0]),
         "action_dim": int(pred_arr.shape[1]),
         "mse": float(np.mean(err_arr**2)),
@@ -1032,21 +745,52 @@ def run_offline_bag_eval(
         "per_step_mae_mean": float(np.mean(mae_per_step)),
     }
 
+    extra_arrays = {}
+    if replay is not None:
+        chunks = replay["chunks"]
+        chunk_times = np.asarray([chunk["infer_ms"] for chunk in chunks], dtype=np.float64)
+        metrics.update({
+            "aggregate_fn_name": None if cfg.rtc_enabled else cfg.aggregate_fn_name,
+            "actions_per_chunk": cfg.actions_per_chunk,
+            "chunk_size_threshold": cfg.chunk_size_threshold,
+            "replay_speed": replay_speed,
+            "pacing_source": replay["pacing_source"],
+            "effective_control_hz": replay["effective_control_hz"],
+            "wall_duration_s": replay["wall_duration_s"],
+            "num_chunks": len(chunks),
+            "dropped_actions": sum(chunk["dropped"] for chunk in chunks),
+            "overlap_actions": sum(chunk["overlap_steps"] for chunk in chunks),
+            "mean_chunk_infer_ms": float(np.mean(chunk_times)),
+            "p95_chunk_infer_ms": float(np.percentile(chunk_times, 95)),
+            "initial_wait_ms": infer_times_ms[0],
+            "mean_steady_state_wait_ms": float(np.mean(infer_times_ms[1:])) if total > 1 else 0.0,
+            "final_drift_ms": replay["timeline"][-1]["drift_ms"],
+            "infer_times_semantics": "main-thread select_action wait; chunk inference reported separately",
+        })
+        with (run_dir / "async_timeline.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(replay["timeline"][0]))
+            writer.writeheader()
+            writer.writerows(replay["timeline"])
+        with (run_dir / "async_chunks.json").open("w", encoding="utf-8") as f:
+            json.dump(chunks, f, indent=2, ensure_ascii=False)
+        extra_arrays = {
+            "chunk_infer_times_ms": chunk_times,
+            "elapsed_s": np.asarray([row["elapsed_s"] for row in replay["timeline"]]),
+            "replay_time_s": np.asarray([row["replay_time_s"] for row in replay["timeline"]]),
+            "queue_sizes": np.asarray([row["queue_after_pop"] for row in replay["timeline"]]),
+        }
+
     np.savez_compressed(
         run_dir / "offline_predictions.npz",
         pred_action=pred_arr,
         bag_action=target_arr,
         error=err_arr,
         infer_times_ms=np.asarray(infer_times_ms, dtype=np.float64),
+        **extra_arrays,
     )
     _write_csv(run_dir / "offline_predictions.csv", pred_arr, target_arr, err_arr)
     with (run_dir / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
-    if events:
-        with (run_dir / "async_events.jsonl").open("w", encoding="utf-8") as f:
-            for event in events:
-                f.write(json.dumps(event, ensure_ascii=False) + "\n")
-
     if plot:
         _plot_actions(run_dir / "action_compare.png", pred_arr, target_arr, plot_dims)
 
@@ -1076,25 +820,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--max-frames", type=int, default=None)
-    parser.add_argument("--chunk-size", type=int, default=100)
-    parser.add_argument(
-        "--mode",
-        choices=["auto", "sync", "async"],
-        default="auto",
-        help="auto follows inference.async_inference; sync uses select_action; async simulates chunk buffer flow.",
-    )
+    parser.add_argument("--chunk-size", type=int, default=100, help="Bag parsing batch size; unrelated to action chunk length.")
+    parser.add_argument("--mode", choices=("sync", "async"), default=None, help="Override inference.async_inference for this offline run.")
+    parser.add_argument("--replay-speed", type=float, default=1.0, help="Async replay speed multiplier; 1 follows bag frame intervals. Sync mode remains unpaced.")
     parser.add_argument("--plot", action="store_true", help="Save action comparison plot.")
     parser.add_argument("--plot-dims", type=str, default=None, help="Comma-separated action dims to plot.")
-    parser.add_argument("--log-step-times", action="store_true", help="Print per-step select_action/buffer timing.")
+    parser.add_argument("--log-step-times", action="store_true", help="Print per-step select_action timing.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     config = load_kuavo_config(str(args.config))
-    bag_path = args.bag or Path(config.inference.go_bag_path or "")
-    if not str(bag_path):
+    if args.mode is not None:
+        config.inference.async_inference = args.mode == "async"
+    configured_bag = config.inference.go_bag_path
+    if args.bag is None and not configured_bag:
         raise ValueError("No bag path provided. Use --bag or set inference.go_bag_path in deploy config.")
+    bag_path = args.bag or Path(configured_bag)
     bag_path = bag_path.expanduser().resolve()
     if not bag_path.exists():
         raise FileNotFoundError(f"Bag does not exist: {bag_path}")
@@ -1106,10 +849,10 @@ def main() -> None:
         output_dir=args.output_dir.expanduser().resolve() if args.output_dir else None,
         max_frames=args.max_frames,
         chunk_size=args.chunk_size,
-        mode=args.mode,
         plot=args.plot,
         plot_dims=_parse_dims(args.plot_dims),
         log_step_times=args.log_step_times,
+        replay_speed=args.replay_speed,
     )
     print(f"Offline eval saved to: {run_dir}")
 

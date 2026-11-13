@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import time
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,24 @@ def _checkpoint_has_weights(checkpoint: Path) -> bool:
     return any(checkpoint.glob("*.safetensors"))
 
 
+def _deploy_config():
+    """Load the exact deploy config the client will run, so warmup can mimic it.
+
+    `load_kuavo_config` applies the total-config merge, `${...}` templates and
+    `inference_env` overrides, so the returned values are what the client
+    actually sends. Returns None if it cannot be read: warming built-in defaults
+    would compile the wrong token shapes, which is the very cost this avoids.
+    """
+    path = os.environ.get("KUAVO_DEPLOY_CONFIG") or kuavo_repo_root() / "configs" / "deploy" / "deploy.yaml"
+    try:
+        from kuavo_deploy.config import load_kuavo_config  # type: ignore
+
+        return load_kuavo_config(str(path))
+    except Exception as exc:  # warmup is best-effort: never block startup
+        print(f"[warmup] deploy config unavailable ({exc}); skipping warmup", flush=True)
+        return None
+
+
 def _stringify_mapping_list(value: Any) -> Any:
     if not isinstance(value, list):
         return value
@@ -119,6 +138,13 @@ def _build_runtime_model_dir(
     config.setdefault("model", {})
     config.setdefault("data", {})
     config.setdefault("train", {})
+    # Trained RTC support is a checkpoint property, not a deployment override.
+    config["model"]["rtc_training_max_delay"] = 0
+    config["train"].pop("rtc_training_max_delay", None)
+    checkpoint_config = checkpoint / "config.json"
+    if checkpoint_config.is_file():
+        checkpoint_metadata = yaml.safe_load(checkpoint_config.read_text(encoding="utf-8")) or {}
+        config["model"]["rtc_training_max_delay"] = int(checkpoint_metadata.get("rtc_training_max_delay", 0))
 
     config["model"]["model_path"] = str(checkpoint)
     if qwen3vl_path is not None:
@@ -230,6 +256,95 @@ class LingBotVlaV2Adapter(ModelServerAdapter):
             use_compile=use_compile,
         )
         self._reset_model_transform()
+        self._warmup()
+
+    def _warmup(self, max_iters: int = 4) -> None:
+        """Pay the JIT/autotune cost of the endpoint that will actually be served.
+
+        `rtc_enabled` decides which single path is warmed. Warming both would
+        double the startup cost and leave a graph/allocator high-water mark that
+        does not match serving; the plain `select_action_chunk` forward in
+        particular degraded steady-state RTC from ~130 ms to ~200 ms.
+
+        Each path still pays two cold costs: the first call compiles the Triton
+        MoE and attention kernels, and for RTC the first call with a prefix plus
+        nonzero delay compiles the frozen-prefix mask path.
+
+        Shape, prompt and RTC options come from the deploy config so the token
+        counts match what the client will send; any difference re-triggers
+        compilation on the first real request.
+        """
+        if os.environ.get("KUAVO_SERVER_WARMUP", "1") == "0":
+            return
+
+        config = _deploy_config()
+        if config is None:
+            return
+        env, inf = config.env, config.inference
+        width, height = (int(value) for value in env.image_size)
+        shape = (height, width, 3)  # deploy.yaml is [width, height]; the model takes HWC
+        prompt = os.environ.get("KUAVO_SERVER_WARMUP_PROMPT") or str(inf.task_prompt or "")
+        obs = {
+            "observation.images.head_cam_h": np.zeros(shape, dtype=np.uint8),
+            "observation.state": np.zeros(
+                _feature_source_dim(self.robot_config_path, "states"), dtype=np.float32
+            ),
+            "prompt": prompt,
+        }
+        self._warmup_signature = (shape, len(prompt))
+
+        rtc = None
+        delay = 0
+        if inf.rtc_enabled:
+            # A trained checkpoint is required for trained mode; otherwise the
+            # RTC endpoint would reject the request, so fall back to guided.
+            max_delay = int(getattr(self.model.config, "rtc_training_max_delay", 0))
+            mode = "guided" if inf.rtc_mode == "trained" and max_delay <= 0 else inf.rtc_mode
+            horizon = max(1, int(inf.rtc_execution_horizon))
+            # Mirror the client's clamp so the prefixed request is accepted.
+            delay = min(max(1, int(inf.rtc_initial_delay_steps)), horizon, max_delay or horizon)
+            rtc = {
+                "mode": mode,
+                "inference_delay": 0,
+                "execution_horizon": horizon,
+                "prefix_attention_schedule": inf.rtc_prefix_attention_schedule,
+                "max_guidance_weight": float(inf.rtc_max_guidance_weight),
+            }
+        # Only the endpoint the client will actually call is warmed: warming both
+        # leaves a graph/allocator high-water mark that does not match serving
+        # and degraded steady-state RTC from ~130 ms to ~200 ms.
+        detail = f"mode={rtc['mode']} horizon={rtc['execution_horizon']} delay={delay}" if rtc else "mode=chunk"
+        print(f"[warmup] {self.name} shape={shape} prompt_len={len(prompt)} {detail}", flush=True)
+        try:
+            for index in range(max_iters):
+                started = time.monotonic()
+                if rtc is None:
+                    self.select_action_chunk(obs)
+                else:
+                    # No outer inference_mode: the guided branch builds an
+                    # autograd graph and inference tensors cannot be saved for backward.
+                    first = self.select_action_chunk_rtc({
+                        "observation": obs, "previous_original": None,
+                        "previous_absolute": None, "previous_context": None,
+                        "rtc": dict(rtc),
+                    })
+                    self.select_action_chunk_rtc({
+                        "observation": obs,
+                        "previous_original": first["original_actions"],
+                        "previous_absolute": first["processed_actions"],
+                        "previous_context": first["action_context"],
+                        "rtc": {**rtc, "inference_delay": delay},
+                    })
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                elapsed = time.monotonic() - started
+                print(f"[warmup] {self.name} {index + 1}/{max_iters} {elapsed * 1000:.0f} ms", flush=True)
+                if elapsed < 1.0:
+                    break
+        except Exception as exc:  # never block startup on a warmup failure
+            print(f"[warmup] {self.name} aborted: {exc}", flush=True)
+        finally:
+            self.reset()
 
     @classmethod
     def add_cli_args(cls, parser: ArgumentParser) -> None:
@@ -303,6 +418,7 @@ class LingBotVlaV2Adapter(ModelServerAdapter):
         self.model.global_step = 0
         self.model.last_action_chunk = None
         self.model.last_normalized_action_chunk = None
+        self.model._rtc_previous_applied = None
         self.model.vla.feature_transform = FeatureTransform(
             str(self.robot_config_path),
             self.model.data_config,
@@ -386,4 +502,57 @@ class LingBotVlaV2Adapter(ModelServerAdapter):
 
     def select_action_chunk(self, obs: dict[str, Any]) -> np.ndarray:
         self._pending_actions.clear()
+        self._warn_on_warmup_mismatch(obs)
         return self._infer_chunk(obs)
+
+    def _warn_on_warmup_mismatch(self, obs: dict[str, Any]) -> None:
+        """Report once if the live request no longer matches what warmup compiled.
+
+        A different image size or prompt length changes the vision/language
+        token counts, so `torch.compile` re-traces and the first real request
+        pays the cold cost again. Surfacing it avoids a mystery slowdown.
+        """
+        if getattr(self, "_warmup_mismatch_reported", False) or not hasattr(self, "_warmup_signature"):
+            return
+        live = (tuple(_to_numpy(obs["observation.images.head_cam_h"]).shape), len(str(obs.get("prompt", ""))))
+        if live == self._warmup_signature:
+            return
+        self._warmup_mismatch_reported = True
+        print(
+            f"[warmup] {self.name} request differs from warmup: "
+            f"image {self._warmup_signature[0]} -> {live[0]}, "
+            f"prompt_len {self._warmup_signature[1]} -> {live[1]}; recompiling",
+            flush=True,
+        )
+
+    def select_action_chunk_rtc(self, payload):
+        from kuavo_server.rtc import flatten_groups, parse_request, reconcile_absolute_prefix, response
+
+        self._pending_actions.clear()
+        t0 = time.perf_counter()
+        maximum = int(getattr(self.model.config, "rtc_training_max_delay", 0))
+        obs, rtc, original, absolute = parse_request(payload, maximum)
+        self._warn_on_warmup_mismatch(obs)
+        prefix = None
+        print(f"[RTC-TIMING] has_prefix={original is not None} mode={rtc.get('mode')} delay={rtc.get('inference_delay')}", flush=True)
+        if original is not None:
+            t = time.perf_counter()
+            groups = self.model.decode_rtc_prefix(original, context=payload.get("previous_context"))
+            print(f"[RTC-TIMING] decode_rtc_prefix {time.perf_counter() - t:.3f}s", flush=True)
+            native, split = flatten_groups(groups, list(self.model.action_key))
+            def pack(step):
+                # The existing adapter composer accepts [T,D], whereas the
+                # model decoder returns [B,T,D]. Remove only the batch axis.
+                return self._convert_action(self._compose_action_from_dict(split(step[None]))[0])
+            t = time.perf_counter()
+            native = reconcile_absolute_prefix(native[0], absolute, pack)
+            prefix = split(native[None])
+            print(f"[RTC-TIMING] reconcile_prefix {time.perf_counter() - t:.3f}s", flush=True)
+        t = time.perf_counter()
+        groups, original, context = self.model.infer_rtc(self._build_model_obs(obs), rtc_options=rtc, absolute_prefix=prefix)
+        print(f"[RTC-TIMING] infer_rtc {time.perf_counter() - t:.3f}s", flush=True)
+        unbatched = {key: np.asarray(value)[0] for key, value in groups.items()}
+        processed = self._convert_action_chunk(self._compose_action_from_dict(unbatched))
+        limit = self.execution_horizon if self.execution_horizon > 0 else len(processed)
+        print(f"[RTC-TIMING] total {time.perf_counter() - t0:.3f}s", flush=True)
+        return response(original[:limit], processed[:limit], maximum, context)

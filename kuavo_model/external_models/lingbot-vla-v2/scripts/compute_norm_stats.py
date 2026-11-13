@@ -32,6 +32,12 @@ logger = helper.create_logger(__name__)
 
 @dataclass
 class NormComputeModelArguments:
+    rtc_training_max_delay: int = field(
+        default=0,
+        metadata={
+            "help": "Accepted for training-config compatibility; unused when computing normalization statistics."
+        },
+    )
     model_path: str = None
     tokenizer_path: str = None
     config_path: str = None

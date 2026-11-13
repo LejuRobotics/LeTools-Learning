@@ -14,11 +14,11 @@ hydra:  # Hydra 配置文件保存目录，仅供参数检查使用
 
 rosbag:
   mode: normal  # 可选: normal, resume, merge
-  rosbag_dir: /path/to/rosbags # rosbag文件存放的目录。normal / resume 模式需要
+  rosbag_dir: /path/to/rosbags  # rosbag文件存放的目录。normal / resume 模式需要
   target_dir: /path/to/target_dir  # 输出父目录；最终数据集会生成在 target_dir/lerobot
   chunk_size: 100  # 分块流式处理每批帧数防止OOM，如果内存不足，可以适当减小该值（可选，默认 100）
   lerobot_dir_resume: /path/to/lerobot_resume  # resume 模式下，已有 lerobot 数据集的目录
-  lerobot_dir_merge: 
+  lerobot_dir_merge:
     ["/path/to/lerobot1",
     "/path/to/lerobot2"]  # merge 模式下，要合并的多个 lerobot 数据集目录列表
   parallel: false  # true 时 rosbag 数据分片并行转换,可加速数据转换，但需要更多内存，仅 normal 模式生效
@@ -38,10 +38,14 @@ dataset:
   main_timeline_fps: 30 # 主相机的帧率，必须稳定，默认30帧
   sample_drop: 10 # 丢弃episode前后的10帧
 
-  # 灵巧手每只手保留的模型自由度。SG100 仅支持 1（开合标量）或 11（全关节）。
-  dex_dof_needed: 11
-  # 0=从第1个关节开始，8=从第9个关节(sg100_9)开始；SG100 dof=11 时必须为 0。
-  dex_dof_offset: 0
+  dex_dof_needed: 11  # 每只手保留的模型自由度，SG100 仅支持 1（开合标量）或 11（全关节）
+  is_binary: false  # 输出 0/1（0=张开，1=闭合），与 leju_claw 的夹爪语义一致
+  dex_dof_offset: 0  # 手动兜底：单手内起始下标（0~10），右手不用加 11（代码自动加）
+
+  # ===== SG100 二值化：手动设置判定关节的开合范围与闭合比例 =====
+  sg100_binary_open: [0, 0]  # 判定关节完全张开时的原始值（弧度），[左手, 右手]
+  sg100_binary_close: [1.57, 1.57]  # 判定关节完全闭合时的原始值（弧度），[左手, 右手]
+  sg100_binary_ratio: 0.1  # (q - open) / (close - open) > ratio 时判为闭合
 
   resize:
     width: 848  # 图像缩放宽度，注意请先查看（推荐浏览器foxglove工具）rosbag中图像的原始尺寸，避免放大或缩小带来模糊或拉伸形变等问题

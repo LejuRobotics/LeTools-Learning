@@ -209,7 +209,7 @@ def main():
     log_robot.info(f"使用配置文件: {config_path}")
     log_robot.info(f"执行任务: {args.task}")
     
-    config = load_kuavo_config(config_path)
+    config = load_kuavo_config(config_path, task=args.task)
     # 初始化机械臂
     try:
         arm = ArmMove(config)

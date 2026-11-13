@@ -487,6 +487,26 @@ class FeatureTransform:
                 batch_dict['future_pil_images'] = future_pil_images
         return batch_dict
 
+    def encode_rtc_prefix(self, observation, absolute_actions):
+        """Apply training's action conversions to a prefix at the current state."""
+        if self.actions_convert_from_state:
+            raise ValueError("RTC requires explicit action features, not future-state-derived actions")
+        item = dict(observation)
+        item.update({key: torch.as_tensor(value).clone() for key, value in absolute_actions.items()})
+        item["action_is_pad"] = torch.zeros(self.chunk_size)
+        item = self.convert_features(item, w_action=True)
+        for feature in self.actions:
+            if self.action_subtract_state[feature]:
+                state_key = feature.replace("action.", "observation.state.")
+                relative_type = self.action_relative_type.get(feature)
+                if _is_quaternion_relative_type(relative_type):
+                    item[feature] = relative_pose_quaternion(item[feature], item[state_key], relative_type=relative_type)
+                else:
+                    item[feature] = item[feature] - item[state_key]
+        if self.normalizer is not None:
+            item = self.normalizer.normalize(item)
+        return prepare_action(self.pad_and_concat(item, True), self.model_config.max_action_dim)
+
     def unapply(self, item):
         if not self.return_item_befor_padding:
             item = self.reverse_pad_and_concat(item)

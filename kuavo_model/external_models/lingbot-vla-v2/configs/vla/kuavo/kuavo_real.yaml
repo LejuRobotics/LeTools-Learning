@@ -4,6 +4,7 @@ model:
   post_training: true
   adanorm_time: true
   config_key: LingbotVLAV2Config
+  rtc_training_max_delay: 0  # >0 启用 RTC clean-prefix 训练，需小于 chunk_size
   moe_implementation: fused
 
 data:

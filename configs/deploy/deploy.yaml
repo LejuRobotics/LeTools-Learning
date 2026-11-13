@@ -10,9 +10,9 @@ env:  # 推理环境设置
   direct_to_wbc: false  # 是否使用direct to wbc模式。
   enable_action_interpolation: true
   control_rate: 100  # WBC插值后的实际控制指令频率
+  execution_mode: inline  # inline/threaded；threaded 需 direct_to_wbc=true，用独立线程按 control_rate 独占下发
   image_size: [848, 480]  # 相机缩放尺寸 option: [640, 480](仿真)/[848, 480](真机）
   camera_encoding: h265  # 相机编码格式: "jpeg" 或 "h265"。h265 时自动订阅 H265 stream topic 并进行实时解码。
-  
 
 inference:  # 推理和评测设置
   go_bag_path: null    # bag 回放路径
@@ -22,7 +22,22 @@ inference:  # 推理和评测设置
   max_episode_steps: 200  # 每条最多跑多少步
   task_prompt: "Pick and Place"
 
-  async_inference: false
-  rtc_lite_enabled: false  # 是否启用 RTC-Lite 队列合并。
-  rtc_full_enabled: false  # 模型空间 RTC；启用时必须关闭 rtc_lite_enabled。
-  rtc_full_mode: vjp  # 可选 vjp / inpainting。
+  async_inference: false  # true：推理与动作执行并行；false：保持同步推理
+  actions_per_chunk: null  # null：本地使用 n_action_steps，远程使用服务返回长度
+  chunk_size_threshold: 0.5  # 剩余动作比例 <= 此值时预取下一块
+  aggregate_fn_name: exp  # latest_only / weighted_average / average / conservative / exp / cosine
+  rtc_enabled: false  # 外挂 openpi / lingbotvla2 / groot；需 async_inference；DAgger 介入时保留模型前缀，松手时刷新
+  rtc_mode: guided  # guided：现有权重通过 VJP 引导；trained：需重新进行 RTC 训练
+  rtc_execution_horizon: 10  # 前缀引导长度，不裁剪返回 chunk；与 adapter execution_horizon 分开
+  rtc_prefix_attention_schedule: exp  # zeros / ones / linear / exp；作用于模型去噪前缀
+  rtc_max_guidance_weight: 10.0
+  rtc_initial_delay_steps: 1  # 第一块之后的初始延迟估计，后续使用最近推理耗时估算
+
+  # 选择 dagger 任务启用介入；是否录制由菜单选择。
+  dagger_handover_duration: 0.3  # 模型→VR 渐变时间，单位 s，>=0；0 为直接切换。
+  dagger_policy_handover_duration: 0.5  # 新模型动作就绪后的回切时间，单位 s，>=0；0 为直接交回。
+
+  dagger_waist_on: false  # 可选 false/true；是否启用 VR 身体位姿＋grip 躯干介入。
+  dagger_waist_pose_max_speed: 1.0  # 单位 rad/s，>0；自动传给 KRC 的躯干关节最大跟随速度，仅腰部介入时生效。
+
+  rosbag_output_dir: outputs/dagger  # dagger 录制目录；相对路径以仓库根目录为基准，也可用绝对路径。

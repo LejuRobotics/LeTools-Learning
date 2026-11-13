@@ -19,7 +19,6 @@
 # which is licensed under the Apache License, Version 2.0.
 
 
-
 """
 分块流式rosbag转换器 - 低内存版本
 
@@ -64,6 +63,7 @@ from kuavo_data.common.config_platform import (
     get_lower_body_joint_slice,
     DEFAULT_PLATFORM,
 )
+from kuavo_data.common.sg100 import sg100_amounts, sg100_binarize
 from kuavo_data.common.h265_utils import (
     H265CameraContext,
     build_camera_timestamp_sources,
@@ -102,6 +102,111 @@ class DatasetConfig:
     video_backend: str | None = None
 
 DEFAULT_DATASET_CONFIG = DatasetConfig()
+
+
+# ============================================================================
+# SG100 1-DOF 二值化
+# 只在 eef_type='sg100' 且 is_binary=True 时生效，其他末端走原有分支。
+# ============================================================================
+
+# 样本太少时不做健全性判定，避免把"某条 episode 夹爪没动"误判成配置错误。
+SG100_CHECK_MIN_SAMPLES = 30
+# 闭合占比超过此值即告警（疑似 open/close 标反、选错关节，或该机器人零位不同）。
+SG100_MAX_CLOSED_RATIO = 0.80
+# 累积桶的键 -> (日志显示名, 来源话题)。action 即数据集的 action 字段。
+SG100_KIND_SOURCE = {"state": ("state", "/sg100_hand_state"),
+                     "action": ("command", "/sg100_hand_command")}
+
+
+def _sg100_amounts(values: np.ndarray, hand: int) -> list:
+    """该手判定关节的开合进度 amount = (q - open) / (close - open)。
+
+    分母带符号，因此"越大越闭合"和"越小越闭合"两种关节都适用。
+    真正的计算在 kuavo_data.common.sg100 里，这里只补上本次转换的参考位姿。
+    """
+    return sg100_amounts(
+        values,
+        hand,
+        kuavo.SG100_BINARY_OPEN,
+        kuavo.SG100_BINARY_CLOSE,
+        kuavo.SG100_BINARY_JOINTS,
+    )
+
+
+def _sg100_binarize(values: np.ndarray) -> np.ndarray:
+    """把 sg100 原始值二值化为 0/1，结果写在每手的代表维上（其余维保持 0）。
+
+    每手使用 dex_dof_offset 指定的关节及手动配置的 open/close 参考值，
+    amount 超过 ratio 即判为闭合(1)。
+    真正的计算在 kuavo_data.common.sg100 里，与在线推理共用同一份实现。
+    """
+    return sg100_binarize(
+        values,
+        kuavo.SG100_BINARY_OPEN,
+        kuavo.SG100_BINARY_CLOSE,
+        kuavo.SG100_BINARY_JOINTS,
+        kuavo.SG100_BINARY_RATIO,
+    )
+
+
+def _sg100_collect(bucket: dict, kind: str, values: np.ndarray) -> None:
+    """累积 sg100 原始值（22 维），供 episode 结束时做健全性检查。
+
+    逐帧调用时 values 是 1 维，atleast_2d 保证拼出来始终是 (N, 22)。
+    """
+    if values.size == 0 or values.shape[-1] != 22:
+        return
+    bucket[kind].append(np.atleast_2d(values.astype(np.float64)))
+
+
+def _sg100_check(bucket: dict, episode_index: int) -> None:
+    """按 episode 打印每只手的 state / command 闭合占比，异常时告警。
+
+    state  <- /sg100_hand_state    （数据集的 observation.state）
+    command <- /sg100_hand_command （数据集的 action）
+    判定关节/开合参考位姿可能不适用于其他机器人，所以只提示、不中断转换：
+    闭合占比过高 -> 疑似 open/close 标反，或判定关节选错；
+    全程未闭合   -> 该通道本 episode 没动，属正常数据。
+    """
+    ratios: dict = {}
+    used = {"left": (0,), "right": (1,), "both": (0, 1)}[kuavo.CONTROL_HAND_SIDE]
+    for kind in ("state", "action"):
+        if not bucket[kind]:
+            continue
+        column = np.concatenate(bucket[kind])          # (N, 22)
+        if column.shape[0] < SG100_CHECK_MIN_SAMPLES:
+            continue
+        for hand in used:
+            amount = np.max(_sg100_amounts(column, hand), axis=0)
+            ratios[(kind, ("left", "right")[hand])] = float(
+                np.mean(amount > kuavo.SG100_BINARY_RATIO))
+
+    if not ratios:
+        return
+
+    def pct(kind: str, hand: str) -> str:
+        value = ratios.get((kind, hand))
+        return f"{value:5.1%}" if value is not None else "    -"
+
+    for hand in ("left", "right"):
+        if ("state", hand) in ratios or ("action", hand) in ratios:
+            log_print.info(
+                f"Episode {episode_index} sg100 {hand:<5} 闭合占比（占本 episode 时长）: "
+                f"state={pct('state', hand)}  command={pct('action', hand)}"
+            )
+
+    for (kind, hand), closed in sorted(ratios.items()):
+        label, topic = SG100_KIND_SOURCE[kind]
+        if closed > SG100_MAX_CLOSED_RATIO:
+            log_print.warning(
+                f"Episode {episode_index} sg100 {label}/{hand} ({topic}): 闭合占比 {closed:.1%} 过高，"
+                f"疑似开合参考位姿标反，或判定关节选错了"
+            )
+        elif closed == 0.0:
+            log_print.warning(
+                f"Episode {episode_index} sg100 {label}/{hand} ({topic}): 本 episode 全程未闭合"
+                f"（该手没动，或判定关节选错了）"
+            )
 
 
 @dataclasses.dataclass
@@ -552,7 +657,7 @@ def populate_dataset_chunked(
     failed_bags = []
     conversion_timings: list[BagConversionTiming] = []
     log_print.info(f"Total episodes to process: {len(episodes)}")
-    
+
     # 内存监控
     process = None
     try:
@@ -590,6 +695,8 @@ def populate_dataset_chunked(
             # 收集当前episode的所有帧
             frames_buffer = []
             frame_count = [0]
+            # sg100 二值化健全性检查用的原始值累积（非 sg100 时为空）
+            sg100_check = {"state": [], "action": []}
             
             def on_frame(aligned_frame: dict, frame_idx: int):
                 """处理单帧对齐数据"""
@@ -651,8 +758,10 @@ def populate_dataset_chunked(
                 if kuavo.IS_BINARY:
                     qiangnao_state  = np.where(qiangnao_state > 50, 1, 0)
                     qiangnao_action = np.where(qiangnao_action > 50, 1, 0)
-                    sg100_state     = np.where(sg100_state > 0.785, 1, 0)
-                    sg100_action    = np.where(sg100_action > 0.785, 1, 0)
+                    _sg100_collect(sg100_check, "state", sg100_state)
+                    _sg100_collect(sg100_check, "action", sg100_action)
+                    sg100_state     = _sg100_binarize(sg100_state)
+                    sg100_action    = _sg100_binarize(sg100_action)
                     claw_state      = np.where(claw_state > 50, 1, 0)
                     claw_action     = np.where(claw_action > 50, 1, 0)
                     rq2f85_state    = np.where(rq2f85_state > 0.4, 1, 0)
@@ -664,8 +773,7 @@ def populate_dataset_chunked(
                     if claw_action.size:     claw_action /= 100
                     if qiangnao_state.size:  qiangnao_state /= 100
                     if qiangnao_action.size: qiangnao_action /= 100
-                    if sg100_state.size:     sg100_state /= 1.57
-                    if sg100_action.size:    sg100_action /= 1.57
+
                     if rq2f85_state.size:    rq2f85_state /= 0.8
                     if rq2f85_action.size:   rq2f85_action /= 255
                     # rq2f85_state = rq2f85_state / 0.8
@@ -879,6 +987,9 @@ def populate_dataset_chunked(
             
             log_print.info(f"Episode {ep_idx} completed: {frame_count[0]} frames")
 
+            if kuavo.USE_SG100 and kuavo.IS_BINARY:
+                _sg100_check(sg100_check, ep_idx)
+
             bag_elapsed = time.perf_counter() - bag_t0
             timing = BagConversionTiming(
                 episode_index=ep_idx,
@@ -1068,7 +1179,6 @@ def main(cfg: DictConfig):
 
     global DEFAULT_JOINT_NAMES_LIST
     kuavo.init_parameters(cfg)
-
     mode = str(cfg.rosbag.get("mode", "normal")).strip().lower()
     n = cfg.rosbag.get("num_used", None)
     raw_dir_cfg = cfg.rosbag.get("rosbag_dir")
@@ -1110,13 +1220,18 @@ def main(cfg: DictConfig):
                  else kuavo.DEFAULT_SG100_JOINT_NAMES if kuavo.USE_SG100
                  else kuavo.DEFAULT_DEXHAND_JOINT_NAMES)
     eef_slices = kuavo.SLICE_CLAW if kuavo.USE_LEJU_CLAW else kuavo.SLICE_DEX
+    # SG100 1dof 二值化使用统一的开合标量名称
+    binary_grip = kuavo.USE_SG100 and kuavo.IS_BINARY and kuavo.DEX_DOF_NEEDED == 1
     DEFAULT_JOINT_NAMES_LIST = []
     selected_sides = (0, 1) if kuavo.CONTROL_HAND_SIDE == "both" else ((0,) if kuavo.CONTROL_HAND_SIDE == "left" else (1,))
     for side_index in selected_sides:
         arm_name_start = side_index * arm_dof_per_side
         DEFAULT_JOINT_NAMES_LIST.extend(arm_names[arm_name_start:arm_name_start + arm_dof_per_side])
-        eef_start, eef_end = eef_slices[side_index]
-        DEFAULT_JOINT_NAMES_LIST.extend(eef_names[eef_start:eef_end])
+        if binary_grip:
+            DEFAULT_JOINT_NAMES_LIST.append(("left", "right")[side_index] + "_grip")
+        else:
+            eef_start, eef_end = eef_slices[side_index]
+            DEFAULT_JOINT_NAMES_LIST.extend(eef_names[eef_start:eef_end])
     if kuavo.USE_5W_WHOLEBODY:
         lower_start, lower_end = get_lower_body_joint_slice(kuavo.PLATFORM_TYPE)
         lower_names = [

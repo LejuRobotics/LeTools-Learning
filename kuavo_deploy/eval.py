@@ -34,14 +34,26 @@ import yaml
 from pathlib import Path
 from time import sleep
 import select, time, threading, queue
+
 # 全局变量
 current_proc = None
 LOG_DIR = None
+_dagger_task = False
 
 
 # ========== 信号处理 ==========
 def cleanup(signum, frame):
     global current_proc
+    if _dagger_task:
+        if current_proc is not None and current_proc.poll() is None:
+            current_proc.send_signal(signal.SIGUSR2)
+            try:
+                current_proc.wait(timeout=35)
+            except subprocess.TimeoutExpired:
+                current_proc.kill()
+                current_proc.wait(timeout=5)
+        # start_task's finally closes the bag after the controller exits.
+        sys.exit(130)
     print("\n⏹️ 捕获到 Ctrl+C，开始终止任务")
     if current_proc and current_proc.poll() is None:
         print(f"⏹️ 正在终止任务 (PID: {current_proc.pid})...")
@@ -96,9 +108,11 @@ def input_listener(input_queue, stop_event):
         if inputok:
             line = sys.stdin.readline()
             # print("line: ", line)  # 换行
-            input_queue.put(line.strip().lower())
+            input_queue.put("s" if not line and _dagger_task else line.strip().lower())
+            if not line and _dagger_task:
+                return
 
-def interactive_controller(stop_timeout=3):
+def interactive_controller(stop_timeout=3, check_health=None):
     global current_proc, LOG_DIR
 
     print("🎮 交互式控制器已启动")
@@ -117,63 +131,70 @@ def interactive_controller(stop_timeout=3):
         target=input_listener, args=(input_queue, stop_event), daemon=True
     ).start()
 
-    while True:
-        # 检查子进程状态
-        if current_proc.poll() is not None:
-            retcode = current_proc.returncode  # 获取退出码
+    try:
+        while True:
+            # 检查子进程状态
+            if current_proc.poll() is not None:
+                retcode = current_proc.returncode  # 获取退出码
 
-            if retcode == 0:
-                print("\n✅ 任务已正常结束")
-            else:
-                print(f"\n❌ 任务异常退出，错误码：{retcode}")
-                print("📄 请查看日志文件：log/kuavo_deploy/kuavo_deploy.log")
+                if retcode == 0:
+                    print("\n✅ 任务已正常结束")
+                else:
+                    print(f"\n❌ 任务异常退出，错误码：{retcode}")
+                    print("📄 请查看日志文件：log/kuavo_deploy/kuavo_deploy.log")
 
-            current_proc = None
-            stop_event.set()
-            break
+                current_proc = None
+                stop_event.set()
+                return "task_exit"
 
 
-        try:
-            cmd = input_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue  # 无输入则继续检测进程
-        # cmd = input(f"🟢 任务运行中 (PID: {current_proc.pid}) > ").strip().lower()  # 会阻塞等待输入
-        # if cmd != "":
-            # stop_event.set()
-        if cmd in ("p", "pause"):
-            print("🔄 发送暂停/恢复信号...")
-            os.kill(current_proc.pid, signal.SIGUSR1)
+            if check_health is not None:
+                check_health()
 
-        elif cmd in ("s", "stop"):
-            print("⏹️  发送停止信号...")
-            os.kill(current_proc.pid, signal.SIGUSR2)
-            forced = False
             try:
-                current_proc.wait(timeout=stop_timeout)
-            except subprocess.TimeoutExpired:
-                current_proc.kill()
-                forced = True
-            print("✅ 任务已强制停止" if forced else "✅ 任务已安全停止")
-            stop_event.set()
-            break
+                cmd = input_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue  # 无输入则继续检测进程
+            # cmd = input(f"🟢 任务运行中 (PID: {current_proc.pid}) > ").strip().lower()  # 会阻塞等待输入
+            # if cmd != "":
+                # stop_event.set()
+            if cmd in ("p", "pause"):
+                print("🔄 发送暂停/恢复信号...")
+                os.kill(current_proc.pid, signal.SIGUSR1)
 
-        elif cmd in ("l", "log"):
-            log_path = LOG_DIR / "kuavo_deploy.log"
-            if log_path.exists():
-                print("📊 显示最新日志 (Ctrl+C 返回):")
-                os.system(f"tail -n 20 {log_path}")
+            elif cmd in ("s", "stop"):
+                print("⏹️  发送停止信号...")
+                os.kill(current_proc.pid, signal.SIGUSR2)
+                forced = False
+                try:
+                    current_proc.wait(timeout=stop_timeout)
+                except subprocess.TimeoutExpired:
+                    current_proc.kill()
+                    current_proc.wait(timeout=5)
+                    forced = True
+                print("✅ 任务已强制停止" if forced else "✅ 任务已安全停止")
+                stop_event.set()
+                return "forced_stop" if forced else "user_stop"
+
+            elif cmd in ("l", "log"):
+                log_path = LOG_DIR / "kuavo_deploy.log"
+                if log_path.exists():
+                    print("📊 显示最新日志 (Ctrl+C 返回):")
+                    os.system(f"tail -n 20 {log_path}")
+                else:
+                    print("❌ 日志文件不存在")
+
+            elif cmd in ("h", "help"):
+                print("📋 可用命令:")
+                print("  p/pause    - 暂停/恢复任务")
+                print("  s/stop     - 停止任务")
+                print("  l/log      - 查看实时日志")
+                print("  h/help     - 显示帮助\n")
+
             else:
-                print("❌ 日志文件不存在")
-
-        elif cmd in ("h", "help"):
-            print("📋 可用命令:")
-            print("  p/pause    - 暂停/恢复任务")
-            print("  s/stop     - 停止任务")
-            print("  l/log      - 查看实时日志")
-            print("  h/help     - 显示帮助\n")
-
-        else:
-            print(f"❌ 未知命令: {cmd}")
+                print(f"❌ 未知命令: {cmd}")
+    finally:
+        stop_event.set()
 
 
 # ========== YAML 解析 ==========
@@ -239,6 +260,7 @@ def print_task_menu(config_path="<config_path>", use_color=True):
     tasks = [
         ("go", "普通任务: 先插值到bag第一帧的位置, 再回放bag包前往工作位置"),
         ("run", "普通任务: 从当前位置直接运行模型"),
+        ("dagger", "DAgger任务: 沿用 dev 推理流程，支持 VR 人工接管与数据采集"),
         ("auto_test", "自动测试任务：仿真中自动测试模型，执行 eval_episodes 次"),
         ("offline_bag", "离线任务：从一条 bag 读取 obs，跑完整推理链路并和 bag action 做误差验证"),
         ("退出", ""),
@@ -255,6 +277,8 @@ def print_task_menu(config_path="<config_path>", use_color=True):
     print(f"📋 数字选择后，会自动执行的命令示例:{RESET}")
     print(f"普通任务:{RESET}")
     print(f"{YELLOW}  python kuavo_deploy/src/scripts/script.py --task <chosen_task> --config {config_path}{RESET}")
+    print(f"DAgger任务:{RESET}")
+    print(f"{YELLOW}  python kuavo_deploy/src/scripts/script.py --task dagger --config {config_path}{RESET}")
     print(f"自动测试任务:{RESET}")
     print(f"{YELLOW}  python kuavo_deploy/src/scripts/script_auto_test.py --task auto_test --config {config_path}{RESET}")
     print(f"离线bag推理:{RESET}")
@@ -360,23 +384,77 @@ def main():
     while True:
         print_task_menu(config_path=config_path, use_color=True)
 
-        sub_choice = input("请选择要执行的示例 (1-5): ").strip()
+        sub_choice = input("请选择要执行的示例 (1-6): ").strip()
 
-        def start_task(cmd):
-            global current_proc
-            log_path = LOG_DIR / "kuavo_deploy.log"
-            with open(log_path, "w") as f:
-                current_proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
-            print(f"任务已启动，PID: {current_proc.pid}")
-            interactive_controller()
+        def start_task(cmd, record_run=False, task=None):
+            global current_proc, _dagger_task
+            if task != "dagger":
+                with (LOG_DIR / "kuavo_deploy.log").open("w") as output:
+                    current_proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.STDOUT)
+                print(f"任务已启动，PID: {current_proc.pid}")
+                interactive_controller()
+                return
+
+            recorder, process, reason = None, None, "task_error"
+            child_env = os.environ.copy()
+            child_env.pop("DAGGER_EPISODE_ID", None)
+            root = str(script_dir.parent)
+            child_env["PYTHONPATH"] = os.pathsep.join([root, child_env.get("PYTHONPATH", "")])
+            previous_path = sys.path[:]
+            sys.path.insert(0, root)
+            _dagger_task = True
+            try:
+                if record_run:
+                    from kuavo_deploy.config import load_kuavo_config
+                    from kuavo_deploy.utils.episode_recorder import EpisodeRecorder
+                    recorder = EpisodeRecorder(load_kuavo_config(config_path, task="dagger"), root)
+                    child_env["DAGGER_EPISODE_ID"] = recorder.start()
+                with (LOG_DIR / "kuavo_deploy.log").open("w") as output:
+                    process = current_proc = subprocess.Popen(
+                        [sys.executable, *cmd[1:]], stdout=output, stderr=subprocess.STDOUT,
+                        env=child_env, start_new_session=True)
+                print(f"任务已启动，PID: {process.pid}")
+                reason = interactive_controller(
+                    stop_timeout=35, check_health=recorder.check_health if recorder else None)
+            except (KeyboardInterrupt, SystemExit):
+                reason = "interrupted"
+                raise
+            except Exception as exc:
+                print(f"❌ DAgger 任务/录包错误: {exc}")
+            finally:
+                try:
+                    if process is not None and process.poll() is None:
+                        process.send_signal(signal.SIGUSR2)
+                        try:
+                            process.wait(timeout=35)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
+                    if recorder is not None:
+                        try:
+                            recorder.finish(reason, process.returncode if process else None)
+                        except Exception as exc:
+                            print(f"❌ 录包未正常结束: {exc}")
+                finally:
+                    current_proc = None
+                    _dagger_task = False
+                    sys.path[:] = previous_path
 
         if sub_choice == "1":
             start_task(["python3", str(script), "--task", "go", "--config", config_path])
         elif sub_choice == "2":
             start_task(["python3", str(script), "--task", "run", "--config", config_path])
         elif sub_choice == "3":
-            start_task(["python3", str(auto_test), "--task", "auto_test", "--config", config_path])
+            print("\n是否录制 rosbag？\n1 - 不录制\n2 - 录制")
+            record_choice = input("请选择 (1-2): ").strip()
+            if record_choice not in ("1", "2"):
+                print("❌ 无效选择: ", record_choice)
+                continue
+            start_task(["python3", str(script), "--task", "dagger", "--config", config_path],
+                       record_run=record_choice == "2", task="dagger")
         elif sub_choice == "4":
+            start_task(["python3", str(auto_test), "--task", "auto_test", "--config", config_path])
+        elif sub_choice == "5":
             bag_path = input("请输入 bag 路径（留空则使用 inference.go_bag_path）: ").strip()
             # plot_choice = input("是否保存 action 对比曲线？(y/N): ").strip().lower()
             cmd = ["python3", "-u", str(offline_bag_eval), "--config", config_path, "--log-step-times"]
@@ -385,7 +463,7 @@ def main():
             # if plot_choice in ("y", "yes"):
             cmd.append("--plot")
             start_task(cmd)
-        elif sub_choice == "5":
+        elif sub_choice == "6":
             print("退出")
             break
         else:

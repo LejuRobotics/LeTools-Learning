@@ -5,6 +5,7 @@
 使用示例:
   python scripts.py --task go --config /path/to/custom_config.yaml"                   # 先插值到bag第一帧的位置，再回放bag包前往工作位置
   python scripts.py --task run --config /path/to/custom_config.yaml"                  # 从当前位置直接运行模型
+  python scripts.py --task dagger --config /path/to/custom_config.yaml                # 沿用 dev 推理流程，支持 DAgger 人工接管
   python scripts.py --task go_run --config /path/to/custom_config.yaml"               # 到达工作位置直接运行模型
   python scripts.py --task here_run --config /path/to/custom_config.yaml"             # 插值至bag的最后一帧状态开始运行
   python scripts.py --task back_to_zero --config /path/to/custom_config.yaml"         # 中断模型推理后，倒放bag包回到0位
@@ -14,13 +15,13 @@ import rospy
 import rosbag
 import time
 import argparse
+import importlib
 from pathlib import Path
 from typing import List, Tuple, Optional
 
 from std_srvs.srv import Trigger, TriggerRequest, TriggerResponse
 
 from kuavo_deploy.utils.logging_utils import setup_logger
-from kuavo_deploy.kuavo_env.KuavoBaseRosEnv import KuavoBaseRosEnv
 from kuavo_deploy.config import load_kuavo_config, KuavoConfig
 import gymnasium as gym
 
@@ -114,6 +115,8 @@ class ArmMove:
         Args:
             bag_path: 轨迹文件路径
         """
+        # Import/register robot environments only when motion is actually requested.
+        importlib.import_module("kuavo_deploy.kuavo_env")
         self.config = config
         # 设置信号处理器
         self.shutdown_requested = False
@@ -454,17 +457,19 @@ class ArmMove:
         """执行运行"""
         # 这里为了安全考虑，加一个stop base的函数
         try:
-            if self.config.inference.async_inference:
-                from kuavo_deploy.src.eval.real_async_test import kuavo_eval_async
-
-                kuavo_eval_async(config=self.config, env=self.env)
-                return
-
             from kuavo_deploy.src.eval.real_single_test import kuavo_eval
-
             kuavo_eval(config=self.config, env=self.env)
         finally:
             self.env.stop_base()
+
+    def close(self) -> None:
+        """Restore controller modes and release ROS resources exactly once."""
+        if self.env is None:
+            return
+        try:
+            self.env.close()
+        finally:
+            self.env = None
 
 def parse_args():
     """解析命令行参数"""
@@ -475,6 +480,7 @@ def parse_args():
 使用示例:
   python scripts.py --task go --config /path/to/custom_config.yaml"                   # 先插值到bag第一帧的位置，再回放bag包前往工作位置
   python scripts.py --task run --config /path/to/custom_config.yaml"                  # 从当前位置直接运行模型
+  python scripts.py --task dagger --config /path/to/custom_config.yaml                # 沿用 dev 推理流程，支持 DAgger 人工接管
   python scripts.py --task go_run --config /path/to/custom_config.yaml"               # 到达工作位置直接运行模型
   python scripts.py --task here_run --config /path/to/custom_config.yaml"             # 插值至bag的最后一帧状态开始运行
   python scripts.py --task back_to_zero --config /path/to/custom_config.yaml"         # 中断模型推理后，倒放bag包回到0位
@@ -482,6 +488,7 @@ def parse_args():
 任务说明:
   go          - 先插值到bag第一帧的位置，再回放bag包前往工作位置
   run         - 从当前位置直接运行模型
+  dagger      - 沿用 dev 推理流程，启用 VR 接管与回切
   go_run      - 到达工作位置直接运行模型
   here_run    - 插值至bag的最后一帧状态开始运行
   back_to_zero - 中断模型推理后，倒放bag包回到0位
@@ -494,7 +501,7 @@ def parse_args():
         "--task", 
         type=str, 
         required=True,
-        choices=["go", "run", "go_run", "here_run", "back_to_zero"],
+        choices=["go", "run", "dagger", "go_run", "here_run", "back_to_zero"],
         help="要执行的任务类型"
     )
     
@@ -513,7 +520,8 @@ def parse_args():
     )
     
     parser.add_argument(
-        "--dry_run",
+        "--dry_run", "--dry-run",
+        dest="dry_run",
         action="store_true",
         help="干运行模式，只显示将要执行的操作但不实际执行"
     )
@@ -536,26 +544,30 @@ def main():
     log_robot.info(f"使用配置文件: {config_path}")
     log_robot.info(f"执行任务: {args.task}")
     
-    config = load_kuavo_config(config_path)
+    config = load_kuavo_config(config_path, task=args.task)
+    extended_lifecycle = config.inference.dagger_on
+    log_robot.info("任务模式: %s, intervention=%s, control_rate=%s, execution_mode=%s",
+                   args.task, config.inference.dagger_on,
+                   config.env.control_rate, config.env.execution_mode)
+    if args.dry_run:
+        log_robot.info("配置校验通过；干运行结束，未初始化机器人环境或执行任务")
+        return
+
     # 初始化机械臂
     try:
         arm = ArmMove(config)
         log_robot.info("机械臂初始化成功")
     except Exception as e:
         log_robot.error(f"机械臂初始化失败: {e}")
+        if extended_lifecycle:
+            raise
         return
-    
-    # 干运行模式
-    if args.dry_run:
-        log_robot.info("=== 干运行模式 ===")
-        log_robot.info(f"将要执行的任务: {args.task}")
-        log_robot.info("干运行模式结束，未实际执行任何操作")
-        return
-    
+
     # 任务映射
     task_map = {
         "go": arm.go,                    # 到达工作位置
         "run": arm.run,                  # 从当前位置直接运行模型
+        "dagger": arm.run,            # dev 推理与 DAgger 仲裁
         "go_run": arm.go_run,           # 到达工作位置直接运行模型
         "here_run": arm.here_run,       # 从go_bag的最后一帧状态开始运行
         "back_to_zero": arm.back_to_zero, # 中断模型推理后，倒放bag包回到0位
@@ -571,6 +583,11 @@ def main():
     except Exception as e:
         traceback.print_exc()
         log_robot.error(f"执行任务 {args.task} 时发生错误: {e}")
+        if extended_lifecycle:
+            raise
+    finally:
+        if extended_lifecycle:
+            arm.close()
 
 if __name__ == "__main__":
     main()

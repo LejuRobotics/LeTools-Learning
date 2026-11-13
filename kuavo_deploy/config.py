@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple, Any, Dict
 import os
 from pathlib import Path
 from copy import deepcopy
+import math
 import yaml
 
 DEFAULT_DEPLOY_CONFIG = "deploy.yaml"
@@ -78,26 +79,57 @@ class ConfigEnv:
     control_rate: int = 100  # WBC/插值后的实际控制指令频率
     enable_action_interpolation: bool = True
     direct_to_wbc: bool = False  # 是否直接将动作发送到WBC
+    # inline: 在推理线程内插值下发（原行为）；threaded: 独立线程按 control_rate 独占下发，
+    # step() 只投递最新目标，避免推理阻塞导致的突发下发抖动。threaded 需要 direct_to_wbc=true。
+    execution_mode: str = "inline"
     image_size: List[int] = field(default_factory=lambda: [640, 480])
     depth_range: List[int] = field(default_factory=lambda: [0, 1500])
     obs_key_map: Dict[str, List[Any]] = field(default_factory=dict)
+    # Derived by the loader before selecting policy cameras; raw recording keeps all views.
+    recording_obs_key_map: Dict[str, Any] = field(default_factory=dict)
     arm_state_keys: List[str]=field(default_factory=list)
     ratio: float = 0.5
     frame_alignment: bool = True
     qiangnao_dof_needed: int = 1
     sg100_dof_needed: int = 1
     sg100_dof_offset: int = 0
-    sg100_open_pose: List[float] = field(default_factory=lambda: [0.0] * 22)
-    sg100_close_pose: List[float] = field(default_factory=lambda: [1.57] * 22)
-    sg100_init_pose: List[float] = field(default_factory=lambda: [0.0] * 22)
+    # 姿态使用弧度，顺序为左手 11 + 右手 11（TH_CMC_ABD, TH_MCP_FLEX, TH_IP_FLEX,
+    # IF_MCP_ABD, IF_MCP_FLEX, IF_PIP_FLEX, MF_MCP_FLEX, MF_PIP_FLEX,
+    # LF_MCP_ABD, LF_MCP_FLEX, LF_PIP_FLEX）。
+    # 注意 SG100 并非所有关节都在 [0, 1.57]：拇指 MCP 为负值区间，小指 MCP_ABD 约 ±3.1。
+    sg100_open_pose: List[float] = field(default_factory=lambda: [
+        1.57, -2.46, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.1, 0.0, 0.0,
+        1.57, -2.46, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.1, 0.0, 0.0,
+    ])
+    sg100_close_pose: List[float] = field(default_factory=lambda: [
+        1.57, -0.89, 1.57, 0.0, 1.57, 1.57, 1.57, 1.57, 3.1, 1.57, 1.57,
+        1.57, -0.89, 1.57, 0.0, 1.57, 1.57, 1.57, 1.57, 3.1, 1.57, 1.57,
+    ])
+    sg100_init_pose: List[float] = field(default_factory=lambda: [
+        1.57, -2.46, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.1, 0.0, 0.0,
+        1.57, -2.46, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.1, 0.0, 0.0,
+    ])
+    # 逐关节合法区间（弧度），用于姿态校验与下发前限幅。
+    # 默认值来自 heiman 5W 实机 bag 实测范围，可按需覆盖。
+    sg100_joint_min: List[float] = field(default_factory=lambda: [
+        0.0, -2.62, -1.05, -1.57, 0.0, -1.05, 0.0, -1.05, 0.0, 0.0, -1.05,
+        0.0, -2.62, -1.05, -1.57, 0.0, -1.05, 0.0, -1.05, 0.0, 0.0, -1.05
+    ])
+    sg100_joint_max: List[float] = field(default_factory=lambda: [
+        2.18, 0.0,  1.57,  0.0,  2.18, 1.57, 2.18, 1.57, 3.14, 2.18, 1.57,
+        2.18, 0.0,  1.57,  0.0,  2.18, 1.57, 2.18, 1.57, 3.14, 2.18, 1.57,
+    ])
     sg100_force_threshold: float = 0.5
-    sg100_force_kp: List[float] = field(default_factory=lambda: [0.5] * 22)
-    sg100_force_kd: List[float] = field(default_factory=lambda: [0.05] * 22)
-    sg100_force_torque_ff: List[float] = field(default_factory=lambda: [0.0] * 22)
-    sg100_force_output_limit: List[float] = field(default_factory=lambda: [1.0] * 22)
+    sg100_force_kp: List[float] = field(default_factory=lambda: [10.0] * 22)
+    sg100_force_kd: List[float] = field(default_factory=lambda: [0.2] * 22)
+    sg100_force_torque_ff: List[float] = field(default_factory=lambda: [0.8] * 22)
+    sg100_force_output_limit: List[float] = field(default_factory=lambda: [0.6] * 22)
     sg100_force_velocities: List[float] = field(default_factory=lambda: [0.0] * 22)
     is_binary_sg100_action: bool = False
     sg100_action_threshold: float = 0.5
+    # SG100 观测二值化的开合行程比例，与数转 dataset.sg100_binary_ratio 同名同义。
+    # 打开 env.is_binary 后生效，判定关节由 sg100_dof_offset 指定。
+    sg100_binary_ratio: float = 0.1
 
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     is_binary: bool = False
@@ -122,6 +154,12 @@ class ConfigEnv:
             raise ValueError("image_size must be a list [height, width]")
         if self.camera_encoding not in ["jpeg", "h265"]:
             raise ValueError(f"Invalid camera_encoding: {self.camera_encoding}. Valid: jpeg, h265")
+        if self.execution_mode not in ("inline", "threaded"):
+            raise ValueError(
+                f"Invalid execution_mode: {self.execution_mode}. Valid: inline, threaded"
+            )
+        if self.execution_mode == "threaded" and not self.direct_to_wbc:
+            raise ValueError("env.execution_mode=threaded requires env.direct_to_wbc=true")
         # Derive dimensions from the platform/config instead of a packed 16D assumption.
         arm_start, arm_end = get_arm_joint_slice(self.platform_type)
         arm_dof = arm_end - arm_start
@@ -150,15 +188,24 @@ class ConfigEnv:
             raise ValueError("sg100_dof_offset + sg100_dof_needed must be <= 11")
         for name in (
             "sg100_open_pose", "sg100_close_pose", "sg100_init_pose",
+            "sg100_joint_min", "sg100_joint_max",
             "sg100_force_kp", "sg100_force_kd", "sg100_force_torque_ff",
             "sg100_force_output_limit", "sg100_force_velocities",
         ):
             if len(getattr(self, name)) != 22:
                 raise ValueError(f"{name} must contain 22 values (11 left + 11 right)")
+        for idx, (low, high) in enumerate(zip(self.sg100_joint_min, self.sg100_joint_max)):
+            if low >= high:
+                raise ValueError(
+                    f"sg100_joint_min[{idx}] ({low}) must be smaller than "
+                    f"sg100_joint_max[{idx}] ({high})"
+                )
         if not 0.0 <= self.sg100_force_threshold <= 1.0:
             raise ValueError("sg100_force_threshold must be in [0, 1]")
         if not 0.0 <= self.sg100_action_threshold <= 1.0:
             raise ValueError("sg100_action_threshold must be in [0, 1]")
+        if not 0.0 < self.sg100_binary_ratio < 1.0:
+            raise ValueError("sg100_binary_ratio must be in (0, 1)")
 
     # -------- Derived properties ----------
     @property
@@ -295,45 +342,65 @@ class ConfigInference:
     epoch: int = 1
     max_episode_steps: int = 1000
     task_prompt: str = ""
-
     async_inference: bool = False
-    async_control_hz: float = 0.0
-    async_buffer_size: int = 32
-    async_low_watermark: int = 4
-    async_warmup_actions: int = 1
-    async_action_timeout: float = 1.0
+    actions_per_chunk: Optional[int] = None  # None: use policy n_action_steps / returned chunk length
+    chunk_size_threshold: float = 0.5
+    aggregate_fn_name: str = "weighted_average"
+    async_timeout_s: float = 30.0
+    rtc_enabled: bool = False
+    rtc_mode: str = "guided"
+    rtc_execution_horizon: int = 10
+    rtc_prefix_attention_schedule: str = "exp"
+    rtc_max_guidance_weight: float = 10.0
+    rtc_initial_delay_steps: int = 1
 
-    # RTC-Lite (deployment-side queue merging). All fields are no-ops when
-    # rtc_lite_enabled is false or async_inference is false.
-    rtc_lite_enabled: bool = False
-    rtc_lite_merge_mode: str = "blend_replace"
-    rtc_lite_overlap_steps: int = 4
-    rtc_lite_freeze_steps: int = 1
-    rtc_lite_ramp: str = "cosine"
-    rtc_lite_delay_mode: str = "measured"
-    rtc_lite_max_delay_steps: int = 8
-    rtc_lite_keep_min_actions: int = 1
-    rtc_lite_log_deltas: bool = True
+    # Runtime state derived from --task, never a YAML switch.
+    dagger_on: bool = field(default=False, init=False)
+    rosbag_output_dir: str = "outputs/dagger"
+    rosbag_min_free_gb: float = 10.0
+    rosbag_buffer_mb: int = 256
+    rosbag_extra_topics: List[str] = field(default_factory=list)
+    dagger_vr_action_timeout: float = 0.2
+    dagger_signal_timeout: float = 0.2
+    dagger_handover_duration: float = 0.3  # Fade the initial arm position/velocity mismatch to VR.
+    dagger_vr_candidate_topic: str = "/dagger/vr/arm_candidate"
+    dagger_policy_handover_duration: float = 0.5
+    dagger_vr_eef_topic: str = "/dagger/vr/eef_action"
+    dagger_left_intervention_topic: str = "/dagger/vr/left_intervention"
+    dagger_right_intervention_topic: str = "/dagger/vr/right_intervention"
+    dagger_waist_on: bool = False  # Follow VR body pose while an active-side grip is held.
+    dagger_waist_pose_max_speed: float = 1.0  # rad/s per joint; sent to KRC torso IK
 
-    # Full RTC (model-space continuity guidance). This is intentionally
-    # separate from RTC-Lite, which blends already decoded robot actions.
-    rtc_full_enabled: bool = False
-    # Explicit RTC implementation. Choose vjp or inpainting.
-    rtc_full_mode: str = "vjp"
-    # Shared: RTC continuity target length. Inpainting uses it as the
-    # old-action initialization length; VJP uses it as the guidance horizon.
-    rtc_full_overlap_steps: int = 8
-    # VJP-only controls.
-    rtc_full_prefix_attention_schedule: str = "exp"
-    rtc_full_max_guidance_weight: float = 5.0
-    # Inpainting-only controls.
-    rtc_full_frozen_steps: int = 2
-    rtc_full_ramp_rate: float = 5.0
-    # Async queue delay compensation and diagnostics.
-    rtc_full_max_delay_steps: int = 8
-    rtc_full_debug: bool = False
 
     def validate(self):
+        if type(self.rtc_enabled) is not bool:
+            raise ValueError("rtc_enabled must be a boolean")
+        if self.rtc_enabled and (not self.async_inference or self.policy_type != "client"):
+            raise ValueError("RTC requires async_inference=true and policy_type=client for the external model adapters")
+        if self.rtc_mode not in ("guided", "trained"):
+            raise ValueError("rtc_mode must be guided or trained")
+        if type(self.rtc_execution_horizon) is not int or self.rtc_execution_horizon <= 0:
+            raise ValueError("rtc_execution_horizon must be a positive integer")
+        if self.rtc_prefix_attention_schedule not in ("zeros", "ones", "linear", "exp"):
+            raise ValueError("Unsupported rtc_prefix_attention_schedule")
+        if not math.isfinite(self.rtc_max_guidance_weight) or self.rtc_max_guidance_weight <= 0:
+            raise ValueError("rtc_max_guidance_weight must be finite and positive")
+        if type(self.rtc_initial_delay_steps) is not int or self.rtc_initial_delay_steps < 0:
+            raise ValueError("rtc_initial_delay_steps must be a non-negative integer")
+        if type(self.async_inference) is not bool:
+            raise ValueError("async_inference must be a boolean")
+        if self.actions_per_chunk is not None and (
+            type(self.actions_per_chunk) is not int or self.actions_per_chunk <= 0
+        ):
+            raise ValueError("actions_per_chunk must be a positive integer or null")
+        if not 0 <= self.chunk_size_threshold <= 1:
+            raise ValueError("chunk_size_threshold must be in [0, 1]")
+        if self.aggregate_fn_name not in (
+            "latest_only", "weighted_average", "average", "conservative", "exp", "cosine",
+        ):
+            raise ValueError("Unknown aggregate_fn_name")
+        if not math.isfinite(self.async_timeout_s) or self.async_timeout_s <= 0:
+            raise ValueError("async_timeout_s must be finite and positive")
         supported_policy_types = [
             "",
             "client",
@@ -350,54 +417,28 @@ class ConfigInference:
         ]
         if self.policy_type not in supported_policy_types:
             raise ValueError(f"Unsupported policy_type '{self.policy_type}'")
+        if not isinstance(self.rosbag_output_dir, str) or not self.rosbag_output_dir.strip():
+            raise ValueError("inference.rosbag_output_dir must be a nonempty path")
+        if (isinstance(self.rosbag_min_free_gb, bool)
+                or not isinstance(self.rosbag_min_free_gb, (int, float))
+                or not math.isfinite(self.rosbag_min_free_gb) or self.rosbag_min_free_gb <= 0):
+            raise ValueError("inference.rosbag_min_free_gb must be finite and > 0")
+        if type(self.rosbag_buffer_mb) is not int or self.rosbag_buffer_mb <= 0:
+            raise ValueError("inference.rosbag_buffer_mb must be a positive integer")
+        if not isinstance(self.rosbag_extra_topics, list) or any(
+                not isinstance(t, str) or not t.startswith("/") or any(c.isspace() for c in t)
+                for t in self.rosbag_extra_topics):
+            raise ValueError("inference.rosbag_extra_topics must be absolute ROS topic names")
         if self.device not in ["cuda", "cpu"]:
             raise ValueError("device must be 'cuda' or 'cpu'")
-
-        # RTC-Lite validation. Keep the hard rules narrow; the plan flags the
-        # freeze/overlap/keep_min relation as a *recommendation*, not a failure.
-        supported_merge_modes = {"blend_replace"}
-        if self.rtc_lite_merge_mode not in supported_merge_modes:
-            raise ValueError(
-                f"Unsupported rtc_lite_merge_mode '{self.rtc_lite_merge_mode}'. "
-                f"Valid: {sorted(supported_merge_modes)}"
-            )
-        supported_ramps = {"linear", "cosine"}
-        if self.rtc_lite_ramp not in supported_ramps:
-            raise ValueError(
-                f"Unsupported rtc_lite_ramp '{self.rtc_lite_ramp}'. Valid: {sorted(supported_ramps)}"
-            )
-        supported_delay_modes = {"measured"}
-        if self.rtc_lite_delay_mode not in supported_delay_modes:
-            raise ValueError(
-                f"Unsupported rtc_lite_delay_mode '{self.rtc_lite_delay_mode}'. "
-                f"Valid: {sorted(supported_delay_modes)}"
-            )
-        if self.rtc_lite_overlap_steps < 0:
-            raise ValueError("rtc_lite_overlap_steps must be >= 0")
-        if self.rtc_lite_freeze_steps < 0:
-            raise ValueError("rtc_lite_freeze_steps must be >= 0")
-        if self.rtc_lite_keep_min_actions < 0:
-            raise ValueError("rtc_lite_keep_min_actions must be >= 0")
-        if self.rtc_lite_enabled and self.rtc_full_enabled:
-            raise ValueError("rtc_lite_enabled and rtc_full_enabled are mutually exclusive")
-        if self.rtc_full_mode not in {"vjp", "inpainting"}:
-            raise ValueError("rtc_full_mode must be vjp or inpainting")
-        if self.rtc_full_overlap_steps < 0:
-            raise ValueError("rtc_full_overlap_steps must be >= 0")
-        if self.rtc_full_frozen_steps < 0:
-            raise ValueError("rtc_full_frozen_steps must be >= 0")
-        if self.rtc_full_frozen_steps > self.rtc_full_overlap_steps:
-            raise ValueError("rtc_full_frozen_steps must be <= rtc_full_overlap_steps")
-        if self.rtc_full_max_delay_steps < 0:
-            raise ValueError("rtc_full_max_delay_steps must be >= 0")
-        if self.rtc_full_ramp_rate < 0:
-            raise ValueError("rtc_full_ramp_rate must be >= 0")
-        if self.rtc_full_prefix_attention_schedule not in {"zeros", "ones", "linear", "exp"}:
-            raise ValueError("rtc_full_prefix_attention_schedule must be zeros, ones, linear, or exp")
-        if self.rtc_full_max_guidance_weight <= 0:
-            raise ValueError("rtc_full_max_guidance_weight must be > 0")
-        if self.rtc_lite_max_delay_steps < 0:
-            raise ValueError("rtc_lite_max_delay_steps must be >= 0")
+        if self.dagger_vr_action_timeout <= 0 or self.dagger_signal_timeout <= 0:
+            raise ValueError("DAgger action and signal timeouts must be > 0")
+        if self.dagger_handover_duration < 0:
+            raise ValueError("DAgger handover duration must be >= 0")
+        if not self.dagger_vr_candidate_topic.startswith("/"):
+            raise ValueError("dagger_vr_candidate_topic must be an absolute topic")
+        if self.dagger_policy_handover_duration < 0:
+            raise ValueError("DAgger policy handover duration must be >= 0")
 
 
 # -----------------------
@@ -411,12 +452,42 @@ class KuavoConfig:
     def validate(self):
         self.env.validate()
         self.inference.validate()
+        if self.inference.dagger_on:
+            if not (self.env.inference_env == "real" and self.env.control_mode == "joint"
+                    and self.env.direct_to_wbc):
+                raise ValueError("DAgger requires real joint control and direct_to_wbc")
+            for name, value in (("env.ros_rate", self.env.ros_rate),
+                                ("env.control_rate", self.env.control_rate)):
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"{name} must be finite and > 0")
+            if self.env.ros_rate > self.env.control_rate:
+                raise ValueError("Policy rate must not exceed env.control_rate")
+            for name in ("eval_episodes", "max_episode_steps"):
+                value = getattr(self.inference, name)
+                if type(value) is not int or value <= 0:
+                    raise ValueError(f"inference.{name} must be a positive integer")
+            timeout = self.inference.async_timeout_s
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("DAgger async_timeout_s must be finite and > 0")
+            if self.env.arm_dof_per_side != 7 or self.env.eef_dof_per_side != 1:
+                raise ValueError("DAgger VR requires joint7 + eef1 per arm")
+        if type(self.inference.dagger_waist_on) is not bool:
+            raise ValueError("inference.dagger_waist_on must be a YAML boolean")
+        if self.inference.dagger_waist_on:
+            if not (self.inference.dagger_on and self.env.use_5w_wholebody
+                    and self.env.inference_env == "real"):
+                raise ValueError("Waist DAgger requires the dagger task, real 5w and 5w_wholebody=true")
+            if all(self.env.lowerlock_5w):
+                raise ValueError("Waist DAgger requires at least one unlocked lower-body joint")
+            if (not math.isfinite(self.inference.dagger_waist_pose_max_speed)
+                    or self.inference.dagger_waist_pose_max_speed <= 0):
+                raise ValueError("dagger_waist_pose_max_speed must be finite and positive")
 
 
 # -----------------------
 # Loader
 # -----------------------
-def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
+def load_kuavo_config(config_path: Optional[str] = None, *, task: Optional[str] = None) -> KuavoConfig:
     """
     Load config from YAML.
     Default path: ./configs/deploy/deploy.yaml
@@ -424,7 +495,14 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
     If the selected config is a simple profile and a matching total config exists
     in a sibling `total/` directory, the total config is loaded first and then the
     simple config overrides it.
+
+    Only task="dagger" enables intervention before validation and environment
+    creation. With no task, intervention remains disabled. The YAML on disk is
+    never modified.
     """
+    if task not in (None, "go", "run", "dagger", "go_run", "here_run", "back_to_zero",
+                    "auto_test", "offline_bag"):
+        raise ValueError(f"Unknown deployment task: {task!r}")
     if config_path is None:
         current_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(current_dir, "../configs", "deploy", DEFAULT_DEPLOY_CONFIG)
@@ -485,21 +563,12 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
     def _filter_obs_key_map_for_eef(cfg_dict: Dict[str, Any]) -> Dict[str, Any]:
         env_cfg = cfg_dict.get("env", {})
         eef_type = env_cfg.get("eef_type")
-        which_arm = env_cfg.get("which_arm", "both")
         obs_key_map = env_cfg.get("obs_key_map", {})
         if not isinstance(obs_key_map, dict):
             return cfg_dict
 
         filtered = {}
         for key, value in obs_key_map.items():
-            if key == "wrist_cam_l" and which_arm == "right":
-                continue
-            if key == "wrist_cam_r" and which_arm == "left":
-                continue
-            if key == "depth_l" and which_arm == "right":
-                continue
-            if key == "depth_r" and which_arm == "left":
-                continue
             if key in {"rq2f85", "leju_claw", "qiangnao", "sg100"} and key != eef_type:
                 continue
             filtered[key] = value
@@ -580,13 +649,24 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
             values = merged_env["limits"]["gripper"][bound]
             if len(values) == 2:
                 merged_env["limits"]["gripper"][bound] = [values[0]] * 11 + [values[1]] * 11
-    merged_inf = {**asdict(default_inf), **inf_cfg}
+    merged_inf = {**{k: v for k, v in asdict(default_inf).items()
+                    if ConfigInference.__dataclass_fields__[k].init}, **inf_cfg}
 
     env = ConfigEnv(**merged_env)
     inference = ConfigInference(**merged_inf)
 
     config = KuavoConfig(env=env, inference=inference)
+    config.inference.dagger_on = task == "dagger"
+    if not config.inference.dagger_on:
+        config.inference.dagger_waist_on = False
     config.env.obs_key_map = config.env.build_obs_key_map()
+    config.env.recording_obs_key_map = deepcopy(config.env.obs_key_map)
+    # Model observations use dev's arm-specific cameras for every task.
+    # Recording keeps the complete physical topic map independently.
+    excluded = {"left": {"wrist_cam_r", "depth_r"},
+                "right": {"wrist_cam_l", "depth_l"}}.get(config.env.which_arm, set())
+    config.env.obs_key_map = {key: spec for key, spec in config.env.obs_key_map.items()
+                              if key not in excluded}
     config.validate()
     return config
 

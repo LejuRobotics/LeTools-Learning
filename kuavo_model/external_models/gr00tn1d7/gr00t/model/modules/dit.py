@@ -66,9 +66,10 @@ class TimestepEncoder(nn.Module):
 
     def forward(self, timesteps):
         dtype = next(self.parameters()).dtype
-        timesteps_proj = self.time_proj(timesteps).to(dtype)
+        shape = timesteps.shape
+        timesteps_proj = self.time_proj(timesteps.reshape(-1)).to(dtype)
         timesteps_emb = self.timestep_embedder(timesteps_proj)  # (N, D)
-        return timesteps_emb
+        return timesteps_emb.reshape(*shape, -1)
 
 
 class AdaLayerNorm(nn.Module):
@@ -92,8 +93,10 @@ class AdaLayerNorm(nn.Module):
         temb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         temb = self.linear(self.silu(temb))
-        scale, shift = temb.chunk(2, dim=1)
-        x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
+        scale, shift = temb.chunk(2, dim=-1)
+        if scale.ndim == 2:
+            scale, shift = scale[:, None], shift[:, None]
+        x = self.norm(x) * (1 + scale) + shift
         return x
 
 
@@ -328,8 +331,10 @@ class DiT(ModelMixin, ConfigMixin):
 
         # Output processing
         conditioning = temb
-        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=-1)
+        if scale.ndim == 2:
+            scale, shift = scale[:, None], shift[:, None]
+        hidden_states = self.norm_out(hidden_states) * (1 + scale) + shift
         if return_all_hidden_states:
             return self.proj_out_2(hidden_states), all_hidden_states
         else:
@@ -406,8 +411,10 @@ class AlternateVLDiT(DiT):
 
         # Output processing
         conditioning = temb
-        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=-1)
+        if scale.ndim == 2:
+            scale, shift = scale[:, None], shift[:, None]
+        hidden_states = self.norm_out(hidden_states) * (1 + scale) + shift
         if return_all_hidden_states:
             return self.proj_out_2(hidden_states), all_hidden_states
         else:

@@ -17,6 +17,8 @@
 - **[2026-05-30]** : 支持lerobot0.5.2内置的10种模型与原版模型(LingbotVLA,LingbotVLA-v2 pi0, pi0fast, pi05, gr00tN1.7)
 - **[2026-08-26]** : 我们推出[Kuavo-VLA-1.0](https://model.lejurobot.com/kuavo-vla-1), 一款基于Kuavo本体与工业场景的垂域大模型。使用方法见[完整文档](https://www.letools.lejurobot.com)
 - **[2026-09-20]** : LeTools-Learning v2.0，新增多种policy、SG100灵巧手末端、Kuavo 5W全身控制和全身VLA案例。详情见 [更新日志](docs/updates/v2_0.md)
+- **[2026-11-12]** : LeTools-Learning v2.1，新增 DAgger 人工介入采集、统一异步推理与 RTC 训练/推理支持，优化部署控制、SG100 和离线评测。详情见 [更新日志](docs/updates/v2_1.md)
+
 ## ✨ 核心特性
 
 | 特性 | 说明 |
